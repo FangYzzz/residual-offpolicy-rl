@@ -88,7 +88,7 @@ class RobosuiteGymWrapper:
         num_envs: int = 1,
         render_gpu_device_id: int = 0,
         camera_size: int = 84,
-        render_size: int | None = None,
+        render_size: tuple[int, int] | int | None = None,
         env_id: int = 0,
     ):
         # ------------------------------------------------------------------
@@ -114,7 +114,13 @@ class RobosuiteGymWrapper:
         self.num_envs = num_envs
         self.render_gpu_device_id = render_gpu_device_id
         self.camera_size = camera_size
-        self.render_size = render_size if render_size is not None else (240, 320)
+        # Convert render_size to tuple if it's an int, or use default (240, 320)
+        if render_size is None:
+            self.render_size = (240, 320)
+        elif isinstance(render_size, int):
+            self.render_size = (render_size, render_size)
+        else:
+            self.render_size = render_size
         self.env_id = env_id
 
         # ------------------------------------------------------------------
@@ -532,7 +538,11 @@ class RobosuiteGymWrapper:
 
 
 def make_dexmimicgen_env(
-    env_name: str, camera_size: int = 84, render_size: int | None = None, render_gpu_device_id: int = 0, env_id: int = 0
+    env_name: str,
+    camera_size: int = 84,
+    render_size: tuple[int, int] | int | None = None,
+    render_gpu_device_id: int = 0,
+    env_id: int = 0,
 ):
     """Factory function to create a DexMimicGen environment for vectorization."""
 
@@ -616,7 +626,7 @@ def create_vectorized_env(
     num_envs: int,
     device: str = "cpu",
     camera_size: int = 84,
-    render_size: int | None = None,
+    render_size: tuple[int, int] | int | None = None,
     debug: bool = False,
     video_key: str = "observation.images.agentview",
 ) -> VectorizedEnvWrapper:

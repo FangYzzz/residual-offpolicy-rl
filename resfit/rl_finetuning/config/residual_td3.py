@@ -35,7 +35,7 @@ class WandBConfig:
 
 @dataclass
 class BasePolicyConfig:
-    wandb_id: str = "robomimic-can-bc/sdo8cku7"
+    wandb_id: str = "TODO"
     wt_type: str = "best"
     wt_version: str = "latest"
 
