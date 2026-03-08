@@ -35,7 +35,7 @@ class WandBConfig:
 
 @dataclass
 class BasePolicyConfig:
-    wandb_id: str = "TODO"
+    wandb_id: str = "dexmg-bc/o2h7mdwe"
     wt_type: str = "best"
     wt_version: str = "latest"
 
@@ -229,7 +229,7 @@ class ResidualTD3CoffeeConfig(ResidualTD3BoxCleanConfig):
     )
     base_policy: BasePolicyConfig = field(
         default_factory=lambda: BasePolicyConfig(
-            wandb_id="TODO",
+            wandb_id="dexmg-bc/o2h7mdwe",
             wt_type="best",
             wt_version="latest",
         )
