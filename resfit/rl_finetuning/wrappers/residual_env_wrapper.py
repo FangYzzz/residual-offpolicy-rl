@@ -127,19 +127,19 @@ class BasePolicyVecEnvWrapper:
             truncated: Truncated tensor
             info: Info dict
         """
-        # Combine base and residual actions
+        # Combine base and residual actions 
         # Residual action is already scaled inside the Actor class
         # To ensure that we can use the same exploration for all dimensions,
         # we use the normalized actions as the action space
         # The normalized base action is stored as [-1, 1] in the replay buffer
         # and the residual action is predicted as action_scale * [-1, 1]
-        combined_naction = self._last_base_naction + residual_naction
+        combined_naction = self._last_base_naction + residual_naction  # line3/line9: at ​= atb ​+ εt/atr
 
         # Unscale back to original action space for environment execution
-        env_action = self.action_scaler.unscale(combined_naction)
+        env_action = self.action_scaler.unscale(combined_naction)  # 环境真实 action 不是 [-1,1]，所以要 反scale
 
         # Step the underlying vectorized environment
-        raw_obs, reward, terminated, truncated, info = self.vec_env.step(env_action)
+        raw_obs, reward, terminated, truncated, info = self.vec_env.step(env_action)  # line4/line9.5: Observe next state st+1, reward rt, done flag dt
 
         # Store the scaled action for replay buffer (already computed above)
         info["scaled_action"] = combined_naction

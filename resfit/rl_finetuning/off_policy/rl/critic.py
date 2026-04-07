@@ -497,6 +497,9 @@ class SpatialEmbQEnsemble(nn.Module):
 
         # Trunk (shared across heads)
         if fuse_patch:
+            print("num_patch =", num_patch, type(num_patch))  # 243
+            print("action_dim =", action_dim, type(action_dim))  # None
+            print("prop_dim =", prop_dim, type(prop_dim))  # None
             proj_in_dim = num_patch + action_dim + prop_dim
             num_proj = patch_dim
         else:

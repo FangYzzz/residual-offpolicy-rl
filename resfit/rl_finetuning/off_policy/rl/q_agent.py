@@ -315,7 +315,7 @@ class QAgent(nn.Module):
 
             # Predict next residual action and form the combined next action
             # Use target_action_noise config to control whether to add noise to target actions
-            next_residual_action = self._act_default(
+            next_residual_action = self._act_default(  # line14: at+1r ∼ πθ′ (st+1, at+1b)
                 obs=next_obs,
                 eval_mode=not self.cfg.target_action_noise,  # Disable noise if target_action_noise=False
                 stddev=stddev,
@@ -326,14 +326,14 @@ class QAgent(nn.Module):
             if self.residual_actor:
                 # Current step: 'action' from the replay buffer is the executed combined action
                 # Next step: combine and clamp to match environment execution
-                next_action = torch.clamp(next_obs["observation.base_action"] + next_residual_action, -1.0, 1.0)
+                next_action = torch.clamp(next_obs["observation.base_action"] + next_residual_action, -1.0, 1.0)  # line15: at+1 = at+1b + at+1r
             else:
                 next_action = next_residual_action
 
             # Compute target Q using min over a random subset of 2 heads
             target_all = self.critic_target.q_value(next_obs["feat"], next_obs["observation.state"], next_action)
             target_q_min = target_all.squeeze(-1)  # [B]
-            target_q = (reward + (discount * target_q_min)).detach()
+            target_q = (reward + (discount * target_q_min)).detach()  # line16: y = rt+(1−dt)∗γ∗minsubset(i) Qφ′i (st+1, at+1)
 
         if self.cfg.clip_q_target_to_reward_range:
             target_q = torch.clamp(target_q, min=0, max=1)  # Sparse rewards are in {0, 1}
@@ -374,7 +374,7 @@ class QAgent(nn.Module):
             losses = [self.critic.c51_loss(logits_per_head[i], target_distribution) for i in range(K)]
             critic_loss = torch.stack(losses).mean()
         else:
-            q_all = self.critic(obs["feat"], obs["observation.state"], action).squeeze(-1)  # [K,B]
+            q_all = self.critic(obs["feat"], obs["observation.state"], action).squeeze(-1)  # [K,B] # 算当前 Q（多头）
             # Compute TD errors for prioritized experience replay (before taking mean)
             td_errors = torch.abs(q_all - target_q.unsqueeze(0)).mean(dim=0)  # [B] - mean across heads
 
@@ -402,6 +402,7 @@ class QAgent(nn.Module):
             metrics["train/importance_weights_min"] = importance_weights.min().item()
             metrics["train/importance_weights_max"] = importance_weights.max().item()
 
+        # line17: 反传更新 encoder + critic
         # Zero gradients
         self.encoder_opt.zero_grad(set_to_none=True)
         self.critic_opt.zero_grad(set_to_none=True)
@@ -424,7 +425,7 @@ class QAgent(nn.Module):
     def _compute_actor_loss(self, obs: dict[str, torch.Tensor], stddev: float):
         assert "feat" in obs, "safety check"
 
-        action_pred: torch.Tensor = self._act_default(
+        action_pred: torch.Tensor = self._act_default(  # residual action（actor 输出）
             obs=obs,
             eval_mode=False,
             # stddev=stddev,
@@ -444,7 +445,7 @@ class QAgent(nn.Module):
         else:
             combined_action = action_pred
 
-        q = self.critic.q_value_for_policy(obs["feat"], obs["observation.state"], combined_action)
+        q = self.critic.q_value_for_policy(obs["feat"], obs["observation.state"], combined_action)  # line20: 用 critic 的 policy Q 来评估并最大化，Update θ to maximize
         actor_loss_base = -q.mean()
 
         actor_loss_total = actor_loss_base + action_l2_penalty
@@ -633,7 +634,7 @@ class QAgent(nn.Module):
             stddev=stddev,
             importance_weights=importance_weights,
         )
-        utils.soft_update_params(self.critic, self.critic_target, self.cfg.critic_target_tau)
+        utils.soft_update_params(self.critic, self.critic_target, self.cfg.critic_target_tau)  # line18: Update critic targets φi′ ← ρφi′ + (1 − ρ)φi
         metrics.update(critic_metric)
 
         if not update_actor:
@@ -648,7 +649,7 @@ class QAgent(nn.Module):
             assert ref_agent is not None
             actor_metric = self.update_actor_rft(obs, stddev, bc_batch, ref_agent)
 
-        utils.soft_update_params(self.actor, self.actor_target, self.cfg.critic_target_tau)
+        utils.soft_update_params(self.actor, self.actor_target, self.cfg.critic_target_tau)  # line21: Update actor target θ′ ← ρθ′ + (1 − ρ)θ
         metrics.update(actor_metric)
 
         return metrics
