@@ -15,6 +15,7 @@ from resfit.rl_finetuning.config.rlpd import ActorConfig, QAgentConfig, RLPDAlgo
 class OfflineDataConfig:
     name: str = "ankile/robomimic-mh-can-image"
     num_episodes: int | None = 300
+    horizon: int = 400
     # Offline data action labeling options
     use_base_policy_for_base_actions: bool = True
     # Normalization safeguards
@@ -198,6 +199,41 @@ class ResidualTD3BoxCleanConfig(ResidualTD3DexmgConfig):
         )
     )
 
+@dataclass
+class ResidualTD3FrankaTomatoConfig(ResidualTD3DexmgConfig):
+    task: str = "FrankaTomatoPnP"
+
+    rl_camera: list[str] = field(
+        default_factory=lambda: [
+            "exterior_image_1_left",
+            "exterior_image_2_left",
+            "wrist_image_left",
+        ]
+    )
+
+    algo: ResidualTD3AlgoConfig = field(
+        default_factory=lambda: ResidualTD3AlgoConfig(
+            total_timesteps=500_000,
+        )
+    )
+
+    wandb: WandBConfig = field(default_factory=lambda: WandBConfig(project="franka-tomato-residual-td3"))
+
+    offline_data: OfflineDataConfig = field(
+        default_factory=lambda: OfflineDataConfig(
+            name="/home/yuan/self_vla/tele_op/lerobot/pnp_pi05_tomato_3cams_wrist",
+            num_episodes=1_000,
+            horizon=400,   # 这里改成真实 episode 长度
+        )
+    )
+    base_policy: BasePolicyConfig = field(
+        default_factory=lambda: BasePolicyConfig(
+            wandb_id="TODO",
+            wt_type="best",
+            wt_version="latest",
+        )
+    )
+
 
 @dataclass
 class ResidualTD3CoffeeConfig(ResidualTD3BoxCleanConfig):
@@ -274,3 +310,4 @@ cs.store(name="residual_td3_square_config", node=ResidualTD3SquareConfig)
 cs.store(name="residual_td3_box_clean_config", node=ResidualTD3BoxCleanConfig)
 cs.store(name="residual_td3_coffee_config", node=ResidualTD3CoffeeConfig)
 cs.store(name="residual_td3_two_arm_cansort_config", node=ResidualTD3TwoArmCanSortConfig)
+cs.store(name="residual_td3_franka_tomato_config", node=ResidualTD3FrankaTomatoConfig)

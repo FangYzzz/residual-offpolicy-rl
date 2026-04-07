@@ -27,6 +27,7 @@ from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+import torch.nn.functional as F
 
 import hydra
 import numpy as np
@@ -50,6 +51,7 @@ from resfit.rl_finetuning.off_policy.common_utils import utils
 from resfit.rl_finetuning.off_policy.rl.q_agent import QAgent
 from resfit.rl_finetuning.utils.dtype import to_uint8
 from resfit.rl_finetuning.utils.evaluate_dexmg import run_dexmg_evaluation
+from resfit.rl_finetuning.utils.evaluate_franka import run_franka_evaluation
 from resfit.rl_finetuning.utils.hugging_face import (
     _hf_download_buffer,
     _hf_upload_buffer,
@@ -59,7 +61,7 @@ from resfit.rl_finetuning.utils.hugging_face import (
 from resfit.rl_finetuning.utils.normalization import ActionScaler, StateStandardizer
 from resfit.rl_finetuning.utils.rb_transforms import MultiStepTransform
 from resfit.rl_finetuning.wrappers.residual_env_wrapper import BasePolicyVecEnvWrapper
-
+from residual_client import ResidualClient
 
 # -----------------------------------------------------------------------------
 # Timing utility --------------------------------------------------------------
@@ -138,11 +140,66 @@ ONLINE_CACHE_DIR = _CACHE_ROOT / "online_buffer_cache"
 # -----------------------------------------------------------------------------
 # Repository-local imports ------------------------------------------------------
 # -----------------------------------------------------------------------------
-os.environ["MUJOCO_GL"] = "egl"
+# os.environ["MUJOCO_GL"] = "egl"
 
-if "MUJOCO_EGL_DEVICE_ID" in os.environ:
-    del os.environ["MUJOCO_EGL_DEVICE_ID"]
+# if "MUJOCO_EGL_DEVICE_ID" in os.environ:
+#     del os.environ["MUJOCO_EGL_DEVICE_ID"]
 
+def process_image_batch(obs_dict, image_keys, out_size=84, rb=False):
+    """
+    将 obs_dict 里的多个图像键统一处理成 [3, out_size, out_size]
+    输入每张图预期是 [H, W, C] 或 [1, H, W, C]
+    输出每张图是 float32, [3, out_size, out_size], range [0, 1]
+    """
+    imgs = []
+    original_shapes = {}
+
+    for k in image_keys:
+        x = obs_dict[k]
+        original_shapes[k] = x.shape
+
+        # 支持 [1,H,W,C] 或 [H,W,C]
+        if x.ndim == 4 and x.shape[0] == 1:
+            x = x.squeeze(0)
+
+        if x.ndim != 3:
+            raise ValueError(f"{k} expected 3 dims [H,W,C], got shape={x.shape}")
+
+        # HWC -> CHW
+        if x.shape[-1] == 3:
+            x = x.permute(2, 0, 1)
+        elif x.shape[0] == 3:
+            pass
+        else:
+            raise ValueError(f"{k} is neither HWC nor CHW, got shape={x.shape}")
+
+        # uint8 -> float
+        if x.dtype == torch.uint8:
+            x = x.float() / 255.0
+        else:
+            x = x.float()
+        imgs.append(x)
+
+    # [N,3,H,W]
+    imgs = torch.stack(imgs, dim=0)
+
+    # 一次性 resize
+    imgs = F.interpolate(
+        imgs,
+        size=(out_size, out_size),
+        mode="bilinear",
+        align_corners=False,
+    )
+
+    # 写回 obs_dict
+    if rb:
+        for i, k in enumerate(image_keys):
+            obs_dict[k] = imgs[i].contiguous()
+    else:  # train
+        for i, k in enumerate(image_keys):
+            obs_dict[k] = imgs[i].contiguous().unsqueeze(0)
+
+    return obs_dict
 
 def _add_transitions_to_buffer(
     *,
@@ -176,6 +233,8 @@ def _add_transitions_to_buffer(
         # Keep only relevant keys & convert images to uint8 for storage
         curr_obs_i = {k: v for k, v in curr_obs_i.items() if k in obs_keys_set}
         next_obs_i = {k: v for k, v in next_obs_i.items() if k in obs_keys_set}
+        curr_obs_i = process_image_batch(curr_obs_i, image_keys, rb=True)  ###
+        next_obs_i = process_image_batch(next_obs_i, image_keys, rb=True)
         to_uint8(curr_obs_i, image_keys)
         to_uint8(next_obs_i, image_keys)
 
@@ -197,6 +256,46 @@ def _add_transitions_to_buffer(
         ).unsqueeze(0)
 
         online_rb.add(td)
+    
+    # obs_keys_set = set(image_keys) | set(lowdim_keys)
+    # for i in range(num_envs):
+    #     # Handle terminal observation (same logic as main loop)
+    #     if done and "final_obs" in info and info["final_obs"][i] is not None:
+    #         final_obs_dict = info["final_obs"][i]
+    #         next_obs_i = {k: torch.as_tensor(v, device=device) for k, v in final_obs_dict.items()}
+    #     else:
+    #         next_obs_i = {k: v for k, v in next_obs.items()}
+
+    #     curr_obs_i = {k: v for k, v in obs.items()}
+
+    #     # Keep only relevant keys & convert images to uint8 for storage
+    #     curr_obs_i = {k: v.squeeze() for k, v in curr_obs_i.items() if k in obs_keys_set}
+    #     next_obs_i = {k: v.squeeze() for k, v in next_obs_i.items() if k in obs_keys_set}
+    #     curr_obs_i = process_image_batch(curr_obs_i, image_keys)
+    #     next_obs_i = process_image_batch(next_obs_i, image_keys)
+    #     to_uint8(curr_obs_i, image_keys)
+    #     to_uint8(next_obs_i, image_keys)
+
+    #     td = TensorDict(
+    #         {
+    #             "obs": TensorDict(curr_obs_i, batch_size=[]),
+    #             "next": TensorDict(
+    #                 {
+    #                     "obs": TensorDict(next_obs_i, batch_size=[]),
+    #                     "done": done.squeeze(),
+    #                     "reward": reward.squeeze(),
+    #                 },
+    #                 batch_size=[],
+    #             ),
+    #             "action": actions.squeeze(),
+    #             "_priority": torch.tensor(10.0, dtype=torch.float32),  # High initial priority for new samples
+    #         },
+    #         batch_size=[],
+    #     ).unsqueeze(0)
+
+    #     online_rb.add(td)
+
+    
 
 
 # -----------------------------------------------------------------------------
@@ -217,75 +316,106 @@ def main(cfg: ResidualTD3DexmgConfig):
     # for residual learning.
     # ---------------------------------------------------------------------
     assert "base_policy" in cfg, "Base policy configuration is required"
-    policy_dir, _ = download_policy_from_wandb(
-        cfg.base_policy.wandb_id,
-        step=cfg.base_policy.wt_type,
-        artifact_version=cfg.base_policy.wt_version,
-    )
+    # policy_dir, _ = download_policy_from_wandb(
+    #     cfg.base_policy.wandb_id,
+    #     step=cfg.base_policy.wt_type,
+    #     artifact_version=cfg.base_policy.wt_version,
+    # )
 
-    base_policy: ACTPolicy = load_policy(policy_dir)
-    base_policy.to(device)
-    base_policy.eval()
-    eval_base_policy: ACTPolicy = load_policy(policy_dir)
-    eval_base_policy.to(device)
-    eval_base_policy.eval()
+    # base_policy: ACTPolicy = load_policy(policy_dir)   # 改成 server client
+    # base_policy.to(device)
+    # base_policy.eval()
+    # eval_base_policy: ACTPolicy = load_policy(policy_dir)
+    # eval_base_policy.to(device)
+    # eval_base_policy.eval()
 
     # Extract the configuration from base policy
-    base_cfg = base_policy.config
+    # base_cfg = base_policy.config
 
-    if isinstance(base_cfg, ACTConfig):
-        cfg.actor_name = "residual_act"
-    else:
-        raise ValueError(f"Unknown base policy type: {type(base_cfg)}")
+    # if isinstance(base_cfg, ACTConfig):
+    #     cfg.actor_name = "residual_act"
+    # else:
+    #     raise ValueError(f"Unknown base policy type: {type(base_cfg)}")
 
     # Load dataset and get normalization functions early
     print("Loading dataset and setting up normalization...")
-    dataset = LeRobotDataset(cfg.offline_data.name)
+    dataset = LeRobotDataset(cfg.offline_data.name)  # todo
+    # dataset_path = "/home/yuan/self_vla/tele_op/lerobot/pnp_pi05_tomato_3cams_wrist"
+    # dataset = LeRobotDataset(dataset_path)
+
+    # just for check
+    # print("stats keys:", list(dataset.meta.stats.keys()))
+    # stats keys: ['exterior_image_1_left', 'eef_position', 'timestamp', 'gripper_position', 'exterior_image_2_left', 
+    # 'joint_actions', 'eef_actions', 'score', 'frame_index', 'index', 'task_index', 'episode_index', 'joint_position', 'wrist_image_left']
+    # sample = dataset[0]
+    # print("sample keys:", list(sample.keys()))
+    # sample keys: ['exterior_image_1_left', 'exterior_image_2_left', 'wrist_image_left', 'joint_position', 'eef_position', 'gripper_position', 
+    # 'joint_actions', 'eef_actions', 'score', 'timestamp', 'frame_index', 'episode_index', 'index', 'task_index', 'task']
+
 
     # Create action scaler from dataset statistics
     action_scaler = ActionScaler.from_dataset_stats(
-        action_stats=dataset.meta.stats["action"],
+        # action_stats=dataset.meta.stats["action"],
+        action_stats=dataset.meta.stats["eef_actions"],
         action_scale=cfg.agent.actor.action_scale,
         min_range_per_dim=cfg.offline_data.min_action_range,
         device=device,
     )
 
     # Create state standardizer from dataset statistics
+    # state_standardizer = StateStandardizer.from_dataset_stats(
+    #     state_stats=dataset.meta.stats["observation.state"],
+    #     min_std=cfg.offline_data.min_state_std,
+    #     device=device,
+    # )
+    def concat_state_stats(stats_a: dict, stats_b: dict) -> dict:
+        out = {}
+        for k in ["mean", "std", "min", "max"]:
+            if k in stats_a and k in stats_b:
+                a = torch.as_tensor(stats_a[k], dtype=torch.float32)
+                b = torch.as_tensor(stats_b[k], dtype=torch.float32)
+                out[k] = torch.cat([a, b], dim=-1)
+        return out
+    
     state_standardizer = StateStandardizer.from_dataset_stats(
-        state_stats=dataset.meta.stats["observation.state"],
+        state_stats=concat_state_stats(
+            dataset.meta.stats["eef_position"],
+            dataset.meta.stats["gripper_position"],
+        ),
         min_std=cfg.offline_data.min_state_std,
         device=device,
     )
+    base_policy = ResidualClient(main_host="127.0.0.1", main_port=8009, action_scaler= action_scaler, state_standardizer=state_standardizer) # todo
+    eval_base_policy = ResidualClient(main_host="127.0.0.1", main_port=8009, action_scaler= action_scaler,state_standardizer= state_standardizer) # todo
+    # def get_envs(
+    #     env_name: str,
+    #     num_envs: int,
+    #     base_policy: ACTPolicy,
+    #     device: str,
+    #     video_key: str,
+    #     debug: bool,
+    #     action_scaler: ActionScaler,
+    #     state_standardizer: StateStandardizer,
+    # ):
+    #     assert action_scaler is not None, "action_scaler must be provided for consistent normalization"
+    #     assert state_standardizer is not None, "state_standardizer must be provided for consistent normalization"
 
-    def get_envs(
-        env_name: str,
-        num_envs: int,
-        base_policy: ACTPolicy,
-        device: str,
-        video_key: str,
-        debug: bool,
-        action_scaler: ActionScaler,
-        state_standardizer: StateStandardizer,
-    ):
-        assert action_scaler is not None, "action_scaler must be provided for consistent normalization"
-        assert state_standardizer is not None, "state_standardizer must be provided for consistent normalization"
+    #     # Create the vectorized environment
+    #     vec_env = create_vectorized_env(
+    #         env_name=env_name,
+    #         num_envs=num_envs,
+    #         device=device,
+    #         video_key=video_key,
+    #         debug=debug,
+    #     )
 
-        # Create the vectorized environment
-        vec_env = create_vectorized_env(
-            env_name=env_name,
-            num_envs=num_envs,
-            device=device,
-            video_key=video_key,
-            debug=debug,
-        )
-
-        # Wrap it with the base policy wrapper
-        return BasePolicyVecEnvWrapper(
-            vec_env=vec_env,
-            base_policy=base_policy,
-            action_scaler=action_scaler,
-            state_standardizer=state_standardizer,
-        )
+    #     # Wrap it with the base policy wrapper
+    #     return BasePolicyVecEnvWrapper(
+    #         vec_env=vec_env,
+    #         base_policy=base_policy,
+    #         action_scaler=action_scaler,
+    #         state_standardizer=state_standardizer,
+    #     )
 
     # ---------------------------------------------------------------------
     # Seeding (must be done before environment creation) ------------------
@@ -311,36 +441,36 @@ def main(cfg: ResidualTD3DexmgConfig):
     # Environment setup ----------------------------------------------------
     # ---------------------------------------------------------------------
     assert cfg.num_envs == 1, "Only support 1 environment for now because of how n_step is implemented"
-    env = get_envs(
-        env_name=cfg.task,
-        num_envs=cfg.num_envs,
-        base_policy=base_policy,
-        device=device_str,
-        video_key=cfg.video_key,
-        debug=cfg.debug,
-        action_scaler=action_scaler,
-        state_standardizer=state_standardizer,
-    )
+    # env = get_envs(
+    #     env_name=cfg.task,
+    #     num_envs=cfg.num_envs,
+    #     base_policy=base_policy,
+    #     device=device_str,
+    #     video_key=cfg.video_key,
+    #     debug=cfg.debug,
+    #     action_scaler=action_scaler,
+    #     state_standardizer=state_standardizer,
+    # )
     cfg.eval_num_envs = min(cfg.eval_num_envs, cfg.eval_num_episodes)
     num_cpus_available = os.cpu_count() - 1 if os.cpu_count() is not None else 1
     cfg.eval_num_envs = min(num_cpus_available, cfg.eval_num_envs)
 
-    eval_env = get_envs(
-        env_name=cfg.task,
-        num_envs=cfg.eval_num_envs,
-        base_policy=eval_base_policy,
-        device=device_str,
-        video_key=cfg.video_key,
-        debug=cfg.debug,
-        action_scaler=action_scaler,
-        state_standardizer=state_standardizer,
-    )
+    # eval_env = get_envs(
+    #     env_name=cfg.task,
+    #     num_envs=cfg.eval_num_envs,
+    #     base_policy=eval_base_policy,
+    #     device=device_str,
+    #     video_key=cfg.video_key,
+    #     debug=cfg.debug,
+    #     action_scaler=action_scaler,
+    #     state_standardizer=state_standardizer,
+    # )
 
     # Seed environments explicitly for reproducibility
-    if hasattr(env, "seed"):
-        env.seed(cfg.seed)
-    if hasattr(eval_env, "seed"):
-        eval_env.seed(cfg.seed + 1)  # Use different seed for eval env to avoid correlation
+    # if hasattr(env, "seed"):
+    #     env.seed(cfg.seed)
+    # if hasattr(eval_env, "seed"):
+    #     eval_env.seed(cfg.seed + 1)  # Use different seed for eval env to avoid correlation
 
     # ---------------------------------------------------------------------
     # Observation / action dimensions -------------------------------------
@@ -348,15 +478,19 @@ def main(cfg: ResidualTD3DexmgConfig):
     # Determine which image keys (camera observations) will be used. The
     # configuration can specify either a single camera name (str) or a list of
     # names.
-    if isinstance(cfg.rl_camera, str):
+    if isinstance(cfg.rl_camera, str): # todo
         image_keys: list[str] = [cfg.rl_camera]
     else:
         image_keys = list(cfg.rl_camera)
     assert isinstance(image_keys, list)
-    lowdim_dim = env.observation_space["observation.state"].shape[1]  # 36
-    img_c, img_h, img_w = env.observation_space[image_keys[0]].shape[1:]
-    action_dim = env.action_space.shape[1]  # 24
+    # lowdim_dim = env.observation_space["observation.state"].shape[1]  # todo define shape 
+    # img_c, img_h, img_w = env.observation_space[image_keys[0]].shape[1:]  # todo define dim shape
+    # action_dim = env.action_space.shape[1]  # todo define dim 
+    # lowdim_keys = ["observation.state", "observation.base_action"]  # todo define key
 
+    lowdim_dim = 8  # 8+8
+    img_c, img_h, img_w =3, 224, 224
+    action_dim = 8
     lowdim_keys = ["observation.state", "observation.base_action"]
 
     # ---------------------------------------------------------------------
@@ -369,8 +503,10 @@ def main(cfg: ResidualTD3DexmgConfig):
         rl_cameras=image_keys,
         cfg=cfg.agent,
         residual_actor=True,  # Enable residual actor mode
-    )
-    horizon = env.vec_env.metadata["horizon"]
+    ) 
+
+    # horizon = env.vec_env.metadata["horizon"]  # todo
+    horizon = cfg.offline_data.horizon
 
     # Set up actor learning rate warmup
     actor_updates = 0
@@ -413,7 +549,7 @@ def main(cfg: ResidualTD3DexmgConfig):
     # Caching layer for online replay buffer ----------------------------
     # ------------------------------------------------------------------
     online_cache_meta = {
-        "task": cfg.task,
+        "task": cfg.task,  # todo!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
         "image_keys": image_keys,
         "n_step": cfg.algo.n_step,
         "gamma": cfg.algo.gamma,
@@ -504,7 +640,7 @@ def main(cfg: ResidualTD3DexmgConfig):
         prefetch=cfg.algo.prefetch_batches,  # Add prefetching
         batch_size=max(offline_batch_size, 1),  # Ensure batch_size is at least 1
     )
-
+    
     # Normalization functions already defined above - use them
 
     # ------------------------------------------------------------------
@@ -516,7 +652,8 @@ def main(cfg: ResidualTD3DexmgConfig):
         image_keys: list[str],
         num_episodes: int | None = None,
         use_base_policy_for_base_actions: bool = False,
-        base_policy: ACTPolicy | None = None,
+        # base_policy: ACTPolicy | None = None,
+        base_policy: ResidualClient | None = None,
     ) -> int:
         """
         Iterates through *dataset* sequentially, converts consecutive frames
@@ -538,13 +675,13 @@ def main(cfg: ResidualTD3DexmgConfig):
 
         # Populate buffer from pre-loaded dataset
         print("Populating offline buffer from dataset...")
-        loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0) # todo load your teleoperation data
+        loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)   # todo define the offline data :  dataset
 
         episode_cache: dict[int, dict] = {}
         transitions = 0
         step_id = 0
 
-        for sample in tqdm(loader, desc="Processing offline dataset"): 
+        for sample in tqdm(loader, desc="Processing offline dataset"):  # 用进度条逐样本处理
             ep_idx = int(sample["episode_index"].item())
             if num_episodes is not None and ep_idx == num_episodes:
                 break
@@ -553,9 +690,16 @@ def main(cfg: ResidualTD3DexmgConfig):
             # Build observation and action directly for replay buffer ----------
             # ------------------------------------------------------------------
             # Extract data and keep on CPU (replay buffer uses CPU storage)
-            _gt_action: torch.Tensor = sample["action"].float().squeeze(0)
+            # _gt_action: torch.Tensor = sample["action"].float().squeeze(0)
+            _gt_action: torch.Tensor = sample["eef_actions"].float().squeeze(0)
             gt_action_scaled = action_scaler.scale(_gt_action)
-            done_flag = bool(sample["next.done"].item())
+            # done_flag = bool(sample["next.done"].item())
+            if "next.done" in sample:  # todo!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+                done_flag = bool(sample["next.done"].item())
+            elif "done" in sample:
+                done_flag = bool(sample["done"].item())
+            else:
+                done_flag = False
 
             # Generate base action based on the selected mode
             if use_base_policy_for_base_actions:
@@ -563,26 +707,28 @@ def main(cfg: ResidualTD3DexmgConfig):
                 # Build raw observation first for base policy inference
                 raw_obs = {}
                 for k in sample:
-                    if "observation" in k:
+                    if "exterior_image_1_left" in k or "wrist_image_left" in k or "exterior_image_2_left" in k or "eef_position" in k or "gripper_position" in k:
                         raw_obs[k] = sample[k].to(device)  # Keep batch dimension for base policy
 
                 # Get base action from base policy
                 with torch.no_grad():
-                    #todo base_action, obs =  get_info_from_main_flower() #
-                    base_action = base_policy.select_action(raw_obs)
-                base_action_scaled = action_scaler.scale(base_action.squeeze(0).cpu()) # todo scale function
+                    # base_action = base_policy.select_action(raw_obs)
+                    # _, base_action, _, _, _ = base_policy.get_obs_and_base_action(raw_obs=raw_obs)  # todo done
+                    base_action = base_policy.get_offline_action_base(raw_obs)  # todo done
+                base_action_scaled = action_scaler.scale(base_action.squeeze(0).cpu())
             else:
                 # Use GT action as base action (original behavior)
                 base_action_scaled = gt_action_scaled
 
-            # Build observation dict directly in target format
+            # Build observation dict directly in target format'
+            state = torch.cat((sample["eef_position"],sample["gripper_position"].unsqueeze(-1)),dim = -1)
             curr_obs = {
-                "observation.state": state_standardizer.standardize(sample["observation.state"].float().squeeze(0)), # todo
+                "observation.state": state_standardizer.standardize(state.float().squeeze(0)),  # todo 
                 "observation.base_action": base_action_scaled,
             }
             for k in image_keys:
                 curr_obs[k] = sample[k].squeeze(0)
-
+            curr_obs = process_image_batch(curr_obs, image_keys, rb=True)  ###
             # Convert images to uint8 for memory-efficient storage
             to_uint8(curr_obs, image_keys)
 
@@ -593,6 +739,7 @@ def main(cfg: ResidualTD3DexmgConfig):
             if ep_idx in episode_cache:
                 # Create transitions for each combination of prev and current variants
                 prev_obs = episode_cache[ep_idx]["obs"]
+                prev_obs = process_image_batch(curr_obs, image_keys, rb=True)  ###
                 prev_action_scaled = episode_cache[ep_idx]["action"]
                 transition = TensorDict(
                     {
@@ -711,14 +858,15 @@ def main(cfg: ResidualTD3DexmgConfig):
             added = len(offline_rb)
     else:
         print("Skipping offline buffer population for online-only training")
-
+    
     # ------------------------------------------------------------------
     # Warm-up phase (random policy) --------------------------------------
     # ------------------------------------------------------------------
 
     if len(online_rb) < cfg.algo.learning_starts and not loaded_online_from_cache:
         print(f"Warm-up: filling online buffer with {cfg.algo.learning_starts - len(online_rb)} random steps…")
-        obs, _ = env.reset()
+        # obs, _ = env.reset()
+        obs = base_policy.reset() # todo reset
         # --------------------------------------------------------------
         # Logging helper: print progress every 1 000 collected transitions
         # --------------------------------------------------------------
@@ -728,6 +876,7 @@ def main(cfg: ResidualTD3DexmgConfig):
         episode_count = 0
 
         while len(online_rb) < cfg.algo.learning_starts:
+            print(f"[warmup] len(online_rb) before step = {len(online_rb)}")
             if cfg.algo.use_base_policy_for_warmup:
                 # Use base policy action + noise (residual exploration)
                 # Since the environment wrapper always adds base_action to residual_action,
@@ -739,18 +888,26 @@ def main(cfg: ResidualTD3DexmgConfig):
                 # Pure uniform random actions - need to cancel out the base policy action
                 # Since env does: combined = base_action + residual_action
                 # To get pure random: residual_action = random - base_action
-                base_action = obs["observation.base_action"]  # Already normalized to [-1, 1]
+                # base_action = obs["observation.base_action"]  # Already normalized to [-1, 1]
+                base_action = base_policy._last_base_action # todo need to normailize  ************may need to reset??
+
                 pure_random = (
                     torch.rand((cfg.num_envs, action_dim), device=device) * 2 - 1
                 ) * cfg.algo.random_action_noise_scale
                 rand_actions = pure_random - base_action
 
             # line4: Observe next state st+1, reward rt, done flag dt
-            next_obs, reward, terminated, truncated, info = env.step(rand_actions)  # line3: Step env with at = εt + atb where atb ∼ πb(st)
-            done = terminated | truncated
+            # next_obs, reward, terminated, truncated, info = env.step(rand_actions)  # line3: Step env with at = εt + atb where atb ∼ πb(st)
+
+            # next_obs, base_action, reward, terminated, truncated, info = base_policy.step(residual_action=rand_actions) # todo need to return  reward, terminated, truncated, info  normalize 
+            # done = terminated | truncated
+            next_obs, reward, done, info = base_policy.step(residual_action=rand_actions) # todo need to return  reward, terminated, truncated, info  normalize 
+            # print(f"[warmup] after step: reward={reward}, done={done}")
 
             reward_sum += reward.sum().item()
             episode_count += done.float().sum().item()
+            # reward_sum += reward
+            # episode_count += int(done)
 
             # Use the executed combined action returned by the environment
             combined_action = info["scaled_action"]
@@ -771,7 +928,7 @@ def main(cfg: ResidualTD3DexmgConfig):
             # ----------------------------------------------------------
             # Progress logging (every ~1 000 transitions) --------------
             # ----------------------------------------------------------
-            if len(online_rb) >= next_log_threshold:
+            if len(online_rb) >= next_log_threshold:  # todo
                 success_rate = reward_sum / episode_count if episode_count > 0 else 0.0
                 print(
                     f"[Warm-up] {len(online_rb)} / {cfg.algo.learning_starts} "
@@ -792,7 +949,7 @@ def main(cfg: ResidualTD3DexmgConfig):
         print(f"Warm-up done. Online buffer size = {len(online_rb)} transitions")
 
         loaded_online_from_cache = True  # treat as cached going forward
-
+    
     _hp_parts: list[str] = [
         cfg.task,  # e.g. "TwoArmBoxCleanup"
         f"n{cfg.algo.n_step}",  # n-step horizon
@@ -842,7 +999,7 @@ def main(cfg: ResidualTD3DexmgConfig):
     )
 
     # Log horizon to wandb summary
-    wandb.summary["environment/horizon"] = env.vec_env.metadata["horizon"]
+    # wandb.summary["environment/horizon"] = env.vec_env.metadata["horizon"]
 
     # Create a timestamped folder in CACHE_DIR for all outputs
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -854,7 +1011,8 @@ def main(cfg: ResidualTD3DexmgConfig):
     model_save_dir.mkdir(parents=True, exist_ok=True)
     outputs_dir.mkdir(parents=True, exist_ok=True)
 
-    obs, _ = env.reset()
+    # obs, _ = env.reset()
+    obs = base_policy.reset() # todo reset
 
     global_step = 0
     best_eval_success_rate = 0.0
@@ -870,6 +1028,50 @@ def main(cfg: ResidualTD3DexmgConfig):
         agent, online_rb, offline_rb, cfg, device, training_timer, online_batch_size, offline_batch_size
     ):
         """Run critic-only updates for warmup phase."""
+        # def print_leaf_shapes(td, name):
+        #     print(f"\n===== {name} =====")
+        #     for key, value in td.items(include_nested=True, leaves_only=True):
+        #         if hasattr(value, "shape"):
+        #             print(f"{key}: shape={tuple(value.shape)}, dtype={value.dtype}")
+        #         else:
+        #             print(f"{key}: type={type(value)}")
+
+        # def compare_td_shapes(td1, td2, name1="online", name2="offline"):
+        #     d1 = {}
+        #     d2 = {}
+
+        #     for key, value in td1.items(include_nested=True, leaves_only=True):
+        #         d1[str(key)] = tuple(value.shape) if hasattr(value, "shape") else str(type(value))
+
+        #     for key, value in td2.items(include_nested=True, leaves_only=True):
+        #         d2[str(key)] = tuple(value.shape) if hasattr(value, "shape") else str(type(value))
+
+        #     all_keys = sorted(set(d1.keys()) | set(d2.keys()))
+        #     print("\n===== SHAPE MISMATCH CHECK =====")
+        #     for k in all_keys:
+        #         s1 = d1.get(k, None)
+        #         s2 = d2.get(k, None)
+        #         if s1 != s2:
+        #             print(f"{k}: {name1}={s1}, {name2}={s2}")
+
+        # for i in range(cfg.algo.critic_warmup_steps):
+        #     with training_timer.time("batch_sampling"):
+        #         online_batch = online_rb.sample(online_batch_size)
+        #         online_batch = online_batch.to(device, non_blocking=True)
+
+        #         if cfg.algo.offline_fraction > 0.0:
+        #             offline_batch = offline_rb.sample(offline_batch_size)
+        #             offline_batch = offline_batch.to(device, non_blocking=True)
+
+        #             # 只在第一次 warmup 时打印，避免刷屏
+        #             if i == 0:
+        #                 print_leaf_shapes(online_batch, "ONLINE")
+        #                 print_leaf_shapes(offline_batch, "OFFLINE")
+        #                 compare_td_shapes(online_batch, offline_batch)
+
+        #             batch = torch.cat([online_batch, offline_batch], dim=0)
+        #         else:
+        #             batch = online_batch
         for i in range(cfg.algo.critic_warmup_steps):
             # Sample mixed online/offline batch
             with training_timer.time("batch_sampling"):
@@ -881,6 +1083,7 @@ def main(cfg: ResidualTD3DexmgConfig):
                     # Mixed online/offline training
                     offline_batch = offline_rb.sample(offline_batch_size)
                     offline_batch = offline_batch.to(device, non_blocking=True)
+
                     batch = torch.cat([online_batch, offline_batch], dim=0)
                 else:
                     # Online-only training
@@ -946,14 +1149,18 @@ def main(cfg: ResidualTD3DexmgConfig):
         with training_timer.time("env_step"):
             with torch.no_grad(), utils.eval_mode(agent):
                 stddev = utils.schedule(cfg.algo.stddev_schedule, global_step)
-                action = agent.act(obs, eval_mode=False, stddev=stddev, cpu=False)  # line8: atr
+
+                obs_act = process_image_batch(obs, image_keys, rb=False)  ###
+                action = agent.act(obs_act, eval_mode=False, stddev=stddev, cpu=False)  # line8: atr
 
             if cfg.algo.progressive_clipping_steps > 0:
                 clip_factor = min(1.0, global_step / cfg.algo.progressive_clipping_steps)
                 action = action * clip_factor
 
-            next_obs, reward, terminated, truncated, info = env.step(action)  # line9: at(atr)
-            done = terminated | truncated  # terminated：任务本身的终止条件满足 truncated：被外部强制截断（时间上限等）
+            # next_obs, reward, terminated, truncated, info = env.step(action)  # line9: at(atr)
+            # done = terminated | truncated  # terminated：任务本身的终止条件满足 truncated：被外部强制截断（时间上限等）
+            next_obs, reward, done, info = base_policy.step(residual_action=action)
+
         if done.any():
             episode_count += done.float().sum().item()
             # Extract episode information from final_info
@@ -1001,8 +1208,8 @@ def main(cfg: ResidualTD3DexmgConfig):
         # ------------------------------------------------------------------
         if global_step % cfg.eval_interval_every_steps == 0 and (cfg.eval_first or global_step > 0):
             with training_timer.time("evaluation"):
-                eval_metrics = run_dexmg_evaluation(
-                    env=eval_env,
+                eval_metrics = run_franka_evaluation(
+                    env=base_policy,  ## todo eval?
                     agent=agent,
                     num_episodes=cfg.eval_num_episodes,
                     device=device,
