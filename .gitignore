@@ -2,8 +2,8 @@ artifacts/
 outputs/
 __pycache__
 wandb/
-offline_buffer_cache/
-online_buffer_cache/
+offline_buffer_*
+online_buffer_*
 bc_run_*
 run_*
 deps/

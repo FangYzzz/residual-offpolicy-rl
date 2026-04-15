@@ -119,10 +119,15 @@ class ResidualTD3DexmgConfig(RLPDDexmgConfig):
     # ------------------------------------------------------------------
     # Logging / checkpointing
     # ------------------------------------------------------------------
-    eval_interval_every_steps: int = 10_000
+    eval_interval_every_steps: int = 3000  # 10_000
 
     # Whether to run an evaluation pass before training begins (at step 0)
     eval_first: bool = True
+
+    resume: bool = False
+    resume_checkpoint: str | None = None
+    checkpoint_interval: int = 500
+    save_replay_on_checkpoint: bool = False
 
 
 @dataclass
@@ -201,7 +206,8 @@ class ResidualTD3BoxCleanConfig(ResidualTD3DexmgConfig):
 
 @dataclass
 class ResidualTD3FrankaTomatoConfig(ResidualTD3DexmgConfig):
-    task: str = "FrankaTomatoPnP"
+    # task: str = "FrankaTomatoPnP"
+    task: str = "pick up the tomato and place it into the bowl"
 
     rl_camera: list[str] = field(
         default_factory=lambda: [
@@ -221,7 +227,7 @@ class ResidualTD3FrankaTomatoConfig(ResidualTD3DexmgConfig):
 
     offline_data: OfflineDataConfig = field(
         default_factory=lambda: OfflineDataConfig(
-            name="/home/yuan/self_vla/tele_op/lerobot/pnp_pi05_tomato_3cams_wrist",
+            name="/home/yuan/self_vla/tele_op/lerobot/pi05_tomato_into",
             num_episodes=1_000,
             horizon=400,   # 这里改成真实 episode 长度
         )
