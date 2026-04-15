@@ -145,27 +145,26 @@ ONLINE_CACHE_DIR = _CACHE_ROOT / "online_buffer_cache"
 # if "MUJOCO_EGL_DEVICE_ID" in os.environ:
 #     del os.environ["MUJOCO_EGL_DEVICE_ID"]
 
-def process_image_batch(obs_dict, image_keys, out_size=84, rb=False):
+def process_image_batch(obs_dict, image_keys, enc_type= "vit", rb=False):
     """
     将 obs_dict 里的多个图像键统一处理成 [3, out_size, out_size]
     输入每张图预期是 [H, W, C] 或 [1, H, W, C]
     输出每张图是 float32, [3, out_size, out_size], range [0, 1]
     """
     imgs = []
-    original_shapes = {}
-
+    # original_shapes = {}
+    
     for k in image_keys:
         x = obs_dict[k]
-        original_shapes[k] = x.shape
+        # original_shapes[k] = x.shape
 
-        # 支持 [1,H,W,C] 或 [H,W,C]
+        # 支持 [1,H,W,C] 或 [1,C,H,W]
         if x.ndim == 4 and x.shape[0] == 1:
             x = x.squeeze(0)
-
         if x.ndim != 3:
             raise ValueError(f"{k} expected 3 dims [H,W,C], got shape={x.shape}")
 
-        # HWC -> CHW
+        # HWC[224,224,3] -> CHW[3,224,224]
         if x.shape[-1] == 3:
             x = x.permute(2, 0, 1)
         elif x.shape[0] == 3:
@@ -182,14 +181,17 @@ def process_image_batch(obs_dict, image_keys, out_size=84, rb=False):
 
     # [N,3,H,W]
     imgs = torch.stack(imgs, dim=0)
-
-    # 一次性 resize
-    imgs = F.interpolate(
-        imgs,
-        size=(out_size, out_size),
-        mode="bilinear",
-        align_corners=False,
-    )
+    
+    # 只有尺寸不匹配时才 resize
+    out_size = 224 if enc_type == "siglip" else 84  # cfg.agent.enc_type == "vit"
+    if imgs.shape[-2] != out_size or imgs.shape[-1] != out_size:
+        imgs = F.interpolate(
+            imgs,
+            size=(out_size, out_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+    # print("process_image_batch-->imgs.shape:", imgs.shape)  # [3,3,224,224] [3, 3, 84, 84]
 
     # 写回 obs_dict
     if rb:
@@ -200,6 +202,146 @@ def process_image_batch(obs_dict, image_keys, out_size=84, rb=False):
             obs_dict[k] = imgs[i].contiguous().unsqueeze(0)
 
     return obs_dict
+
+def save_training_checkpoint(
+    ckpt_path: Path,
+    agent,
+    online_rb,
+    offline_rb,
+    global_step: int,
+    best_eval_success_rate: float,
+    training_cum_time: float,
+    episode_count: int,
+    actor_updates: int,
+    run_name: str,
+    cfg,
+    save_replay_buffers: bool = False,
+):
+    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+
+    checkpoint = {
+        "global_step": global_step,
+        "actor": agent.actor.state_dict(),
+        "critic": agent.critic.state_dict(),
+        "actor_opt": agent.actor_opt.state_dict(),
+        "critic_opt": agent.critic_opt.state_dict(),
+        "best_eval_success_rate": best_eval_success_rate,
+        "training_cum_time": training_cum_time,
+        "episode_count": episode_count,
+        "actor_updates": actor_updates,
+        "run_name": run_name,
+        "cfg": OmegaConf.to_container(cfg, resolve=True),
+
+        # RNG states
+        "python_random_state": random.getstate(),
+        "numpy_random_state": np.random.get_state(),
+        "torch_random_state": torch.get_rng_state(),
+        "cuda_random_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+    torch.save(checkpoint, ckpt_path)
+    print(f"Saved checkpoint to {ckpt_path}")
+
+    if save_replay_buffers:
+        rb_dir = ckpt_path.parent / f"{ckpt_path.stem}_replay"
+        rb_dir.mkdir(parents=True, exist_ok=True)
+
+        online_dir = rb_dir / "online_rb"
+        offline_dir = rb_dir / "offline_rb"
+
+        if online_dir.exists():
+            shutil.rmtree(online_dir)
+        if offline_dir.exists():
+            shutil.rmtree(offline_dir)
+
+        optimized_replay_buffer_dumps(online_rb, online_dir)
+        optimized_replay_buffer_dumps(offline_rb, offline_dir)
+
+        meta = {
+            "online_size": len(online_rb),
+            "offline_size": len(offline_rb),
+        }
+        with open(rb_dir / "meta.json", "w") as f:
+            json.dump(meta, f, indent=2)
+
+        print(f"Saved replay buffers to {rb_dir}")
+
+def load_training_checkpoint(
+    ckpt_path: str | Path,
+    agent,
+    online_rb,
+    offline_rb,
+    device: torch.device,
+    load_replay_buffers: bool = False,
+):
+    ckpt_path = Path(ckpt_path)
+    checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+
+    agent.actor.load_state_dict(checkpoint["actor"])
+    agent.critic.load_state_dict(checkpoint["critic"])
+    agent.actor_opt.load_state_dict(checkpoint["actor_opt"])
+    agent.critic_opt.load_state_dict(checkpoint["critic_opt"])
+
+    global_step = checkpoint.get("global_step", 0)
+    best_eval_success_rate = checkpoint.get("best_eval_success_rate", 0.0)
+    training_cum_time = checkpoint.get("training_cum_time", 0.0)
+    episode_count = checkpoint.get("episode_count", 0)
+    actor_updates = checkpoint.get("actor_updates", 0)
+    run_name = checkpoint.get("run_name", None)
+
+    # Restore RNG states
+    if "python_random_state" in checkpoint:
+        random.setstate(checkpoint["python_random_state"])
+    if "numpy_random_state" in checkpoint:
+        np.random.set_state(checkpoint["numpy_random_state"])
+    if "torch_random_state" in checkpoint and checkpoint["torch_random_state"] is not None:
+        torch_rng_state = checkpoint["torch_random_state"]
+        if not isinstance(torch_rng_state, torch.Tensor):
+            torch_rng_state = torch.tensor(torch_rng_state, dtype=torch.uint8)
+        else:
+            torch_rng_state = torch_rng_state.to(dtype=torch.uint8, device="cpu")
+        torch.set_rng_state(torch_rng_state)
+    if torch.cuda.is_available() and checkpoint.get("cuda_random_state") is not None:
+        cuda_rng_state = checkpoint["cuda_random_state"]
+        fixed_cuda_states = []
+        for s in cuda_rng_state:
+            if not isinstance(s, torch.Tensor):
+                s = torch.tensor(s, dtype=torch.uint8)
+            else:
+                s = s.to(dtype=torch.uint8, device="cpu")
+            fixed_cuda_states.append(s)
+        torch.cuda.set_rng_state_all(fixed_cuda_states)
+
+    if load_replay_buffers:
+        rb_dir = ckpt_path.parent / f"{ckpt_path.stem}_replay"
+        online_dir = rb_dir / "online_rb"
+        offline_dir = rb_dir / "offline_rb"
+
+        if online_dir.exists():
+            online_rb.sampler._empty()
+            optimized_replay_buffer_loads(online_rb, online_dir)
+            print(f"Loaded online replay buffer from {online_dir}, size={len(online_rb)}")
+        else:
+            print(f"Online replay buffer dir not found: {online_dir}")
+
+        if offline_dir.exists():
+            offline_rb.sampler._empty()
+            optimized_replay_buffer_loads(offline_rb, offline_dir)
+            print(f"Loaded offline replay buffer from {offline_dir}, size={len(offline_rb)}")
+        else:
+            print(f"Offline replay buffer dir not found: {offline_dir}")
+
+    print(f"Loaded checkpoint from {ckpt_path}!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+    return {
+        "global_step": global_step,
+        "best_eval_success_rate": best_eval_success_rate,
+        "training_cum_time": training_cum_time,
+        "episode_count": episode_count,
+        "actor_updates": actor_updates,
+        "run_name": run_name,
+    }
+
+
 
 def _add_transitions_to_buffer(
     *,
@@ -214,6 +356,7 @@ def _add_transitions_to_buffer(
     lowdim_keys: list[str],
     num_envs: int,
     online_rb: TensorDictPrioritizedReplayBuffer,
+    enc_type: str,
 ) -> None:
     """Helper function to create transitions and add them to the replay buffer.
 
@@ -233,8 +376,8 @@ def _add_transitions_to_buffer(
         # Keep only relevant keys & convert images to uint8 for storage
         curr_obs_i = {k: v for k, v in curr_obs_i.items() if k in obs_keys_set}
         next_obs_i = {k: v for k, v in next_obs_i.items() if k in obs_keys_set}
-        curr_obs_i = process_image_batch(curr_obs_i, image_keys, rb=True)  ###
-        next_obs_i = process_image_batch(next_obs_i, image_keys, rb=True)
+        curr_obs_i = process_image_batch(curr_obs_i, image_keys, enc_type, rb=True)  ###
+        next_obs_i = process_image_batch(next_obs_i, image_keys, enc_type, rb=True)
         to_uint8(curr_obs_i, image_keys)
         to_uint8(next_obs_i, image_keys)
 
@@ -302,8 +445,12 @@ def _add_transitions_to_buffer(
 # Main training loop -----------------------------------------------------------
 # -----------------------------------------------------------------------------
 def main(cfg: ResidualTD3DexmgConfig):
+    print("cfg.algo.random_action_noise_scale:::::", cfg.algo.random_action_noise_scale)
+    print("cfg.task:::::", cfg.task)
     device_str = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device_str)
+    enc_type=cfg.agent.enc_type
+    print("agent.enc_type:::::", enc_type)
 
     # Enable performance optimizations
     if device.type == "cuda":
@@ -340,6 +487,7 @@ def main(cfg: ResidualTD3DexmgConfig):
     # Load dataset and get normalization functions early
     print("Loading dataset and setting up normalization...")
     dataset = LeRobotDataset(cfg.offline_data.name)  # todo
+    print("stats keys:", list(dataset.meta.stats.keys()))
     # dataset_path = "/home/yuan/self_vla/tele_op/lerobot/pnp_pi05_tomato_3cams_wrist"
     # dataset = LeRobotDataset(dataset_path)
 
@@ -489,7 +637,8 @@ def main(cfg: ResidualTD3DexmgConfig):
     # lowdim_keys = ["observation.state", "observation.base_action"]  # todo define key
 
     lowdim_dim = 8  # 8+8
-    img_c, img_h, img_w =3, 224, 224
+    # img_c, img_h, img_w =3, 224, 224
+    img_c, img_h, img_w =3, 84, 84
     action_dim = 8
     lowdim_keys = ["observation.state", "observation.base_action"]
 
@@ -728,7 +877,7 @@ def main(cfg: ResidualTD3DexmgConfig):
             }
             for k in image_keys:
                 curr_obs[k] = sample[k].squeeze(0)
-            curr_obs = process_image_batch(curr_obs, image_keys, rb=True)  ###
+            curr_obs = process_image_batch(curr_obs, image_keys, enc_type, rb=True)  ###
             # Convert images to uint8 for memory-efficient storage
             to_uint8(curr_obs, image_keys)
 
@@ -739,7 +888,7 @@ def main(cfg: ResidualTD3DexmgConfig):
             if ep_idx in episode_cache:
                 # Create transitions for each combination of prev and current variants
                 prev_obs = episode_cache[ep_idx]["obs"]
-                prev_obs = process_image_batch(curr_obs, image_keys, rb=True)  ###
+                # prev_obs = process_image_batch(prev_obs, image_keys, enc_type, rb=True)  ###
                 prev_action_scaled = episode_cache[ep_idx]["action"]
                 transition = TensorDict(
                     {
@@ -923,6 +1072,7 @@ def main(cfg: ResidualTD3DexmgConfig):
                 lowdim_keys=lowdim_keys,
                 num_envs=cfg.num_envs,
                 online_rb=online_rb,
+                enc_type=enc_type
             )
 
             # ----------------------------------------------------------
@@ -1018,6 +1168,7 @@ def main(cfg: ResidualTD3DexmgConfig):
     best_eval_success_rate = 0.0
     training_cum_time = 0.0
     episode_count = 0
+    actor_updates = 0
 
     train_start_time = time.time()
 
@@ -1124,10 +1275,30 @@ def main(cfg: ResidualTD3DexmgConfig):
                     f"train/critic_loss={metrics['train/critic_loss']:.4f}"
                 )
 
+    if getattr(cfg, "resume", False) and getattr(cfg, "resume_checkpoint", None):
+        print(f"Resuming training from checkpoint: {cfg.resume_checkpoint}")
+        resume_state = load_training_checkpoint(
+            ckpt_path=cfg.resume_checkpoint,
+            agent=agent,
+            online_rb=online_rb,
+            offline_rb=offline_rb,
+            device=device,
+            load_replay_buffers=False,
+        )
+
+        global_step = resume_state["global_step"]
+        best_eval_success_rate = resume_state["best_eval_success_rate"]
+        training_cum_time = resume_state["training_cum_time"]
+        episode_count = resume_state["episode_count"]
+        actor_updates = resume_state["actor_updates"]
+
+        # resume 后重新 reset env，继续采样
+        obs = base_policy.reset()
+    
     # ------------------------------------------------------------------
     # Critic warmup phase ----------------------------------------------
     # ------------------------------------------------------------------
-    if cfg.algo.critic_warmup_steps > 0:
+    if cfg.algo.critic_warmup_steps > 0 and not cfg.resume:
         print(f"Critic warmup: running {cfg.algo.critic_warmup_steps} critic-only updates...")
         _run_critic_warmup(
             agent=agent,
@@ -1150,8 +1321,8 @@ def main(cfg: ResidualTD3DexmgConfig):
             with torch.no_grad(), utils.eval_mode(agent):
                 stddev = utils.schedule(cfg.algo.stddev_schedule, global_step)
 
-                obs_act = process_image_batch(obs, image_keys, rb=False)  ###
-                action = agent.act(obs_act, eval_mode=False, stddev=stddev, cpu=False)  # line8: atr
+                obs_act = process_image_batch(obs, image_keys, enc_type, rb=False)  ###
+                action = agent.act(obs_act, eval_mode=False, stddev=stddev, cpu=False)  # line8: atr !!!
 
             if cfg.algo.progressive_clipping_steps > 0:
                 clip_factor = min(1.0, global_step / cfg.algo.progressive_clipping_steps)
@@ -1163,20 +1334,20 @@ def main(cfg: ResidualTD3DexmgConfig):
 
         if done.any():
             episode_count += done.float().sum().item()
-            # Extract episode information from final_info
-            final_info = info["final_info"]
-            episode_steps = final_info["episode_steps"]
-            episode_indices = final_info["_episode_steps"]
+            # # Extract episode information from final_info
+            # final_info = info["final_info"]
+            # episode_steps = final_info["episode_steps"]
+            # episode_indices = final_info["_episode_steps"]
 
-            # Calculate discounted episode return
-            discount_factor = cfg.algo.gamma ** episode_steps[episode_indices]
-            episode_rewards = reward.cpu().numpy()[episode_indices]
-            episode_return = np.mean(discount_factor * episode_rewards)
+            # # Calculate discounted episode return
+            # discount_factor = cfg.algo.gamma ** episode_steps[episode_indices]
+            # episode_rewards = reward.cpu().numpy()[episode_indices]
+            # episode_return = np.mean(discount_factor * episode_rewards)
 
             wandb.log(
                 {
-                    "training/episode_return": episode_return,
-                    "training/episode_steps": episode_steps,
+                    # "training/episode_return": episode_return,
+                    # "training/episode_steps": episode_steps,
                     "training/episode_count": episode_count,
                 },
                 step=global_step,
@@ -1199,7 +1370,9 @@ def main(cfg: ResidualTD3DexmgConfig):
             lowdim_keys=lowdim_keys,
             num_envs=cfg.num_envs,
             online_rb=online_rb,
+            enc_type=enc_type
         )
+        print("---------------------- _add_transitions_to_buffer ----------------------")
 
         obs = next_obs  # roll
 
@@ -1387,7 +1560,23 @@ def main(cfg: ResidualTD3DexmgConfig):
                 )
 
             print(print_msg)
-
+        if global_step % cfg.checkpoint_interval == 0:
+            ckpt_path = model_save_dir / f"checkpoint_{global_step}.pt"
+            save_training_checkpoint(
+                ckpt_path=ckpt_path,
+                agent=agent,
+                online_rb=online_rb,
+                offline_rb=offline_rb,
+                global_step=global_step,
+                best_eval_success_rate=best_eval_success_rate,
+                training_cum_time=training_cum_time,
+                episode_count=episode_count,
+                actor_updates=actor_updates,
+                run_name=run_name,
+                cfg=cfg,
+                save_replay_buffers=cfg.save_replay_on_checkpoint,
+            )
+    
     print(f"Training finished in {time.time() - train_start_time:.2f} seconds.")
 
     # Clean up entire run directory after successful completion (videos/logs are saved to wandb)

@@ -21,6 +21,14 @@ class VitEncoderConfig:
     stride: int = -1
     act_layer = nn.GELU
 
+@dataclass
+class SiglipEncoderConfig:
+    model_name: str = "google/siglip-base-patch16-224"
+    freeze: bool = True
+    force_image_size: int = 224
+    use_processor_norm: bool = False
+    drop_cls_token: bool = False
+
 
 @dataclass
 class CriticLossCfg:
@@ -105,8 +113,9 @@ class QAgentConfig:
     lr_warmup_start: float = 1e-8  # Starting LR for warmup (very small positive value)
     # encoder
     use_prop: int = 1
-    enc_type: str = "vit"
+    enc_type: str = "vit" # "vit" or "siglip"  # !!!
     vit: VitEncoderConfig = field(default_factory=lambda: VitEncoderConfig())
+    siglip: SiglipEncoderConfig = field(default_factory=SiglipEncoderConfig)
     # critic & actor
     critic: CriticConfig = field(default_factory=lambda: CriticConfig())
     actor: ActorConfig = field(default_factory=lambda: ActorConfig())
@@ -257,7 +266,7 @@ class RLPDDexmgConfig:
     task: str = "Can"
     num_envs: int = 1
     eval_num_envs: int = 8
-    eval_num_episodes: int = 50
+    eval_num_episodes: int = 10  # 50
     headless: bool = True
     video_key: str = "observation.images.agentview"
     rl_camera: list[str] = field(

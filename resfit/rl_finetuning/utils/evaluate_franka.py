@@ -16,7 +16,7 @@ import torch.nn.functional as F
 import wandb
 # from resfit.dexmg.environments.dexmg import VectorizedEnvWrapper
 from resfit.rl_finetuning.off_policy.rl.q_agent import QAgent
-from resfit.rl_finetuning.utils.residual_client import ResidualClient
+from resfit.rl_finetuning.scripts.residual_client import ResidualClient
 def process_image_batch_dim(obs_dict, image_keys, out_size=84):
     """
     将 obs_dict 里的多个图像键统一处理成 [3, out_size, out_size]
@@ -70,7 +70,7 @@ def process_image_batch_dim(obs_dict, image_keys, out_size=84):
     return obs_dict
 
 
-def run_mav_evaluation(
+def run_franka_evaluation(
     *,
     env: ResidualClient,
     agent: QAgent,
@@ -119,9 +119,9 @@ def run_mav_evaluation(
     # Initialize progress display with dots
     progress_dots = ["."] * num_episodes
     print(f"Evaluating {num_episodes} episodes: {''.join(progress_dots)}", end="", flush=True)
-    image_keys=["observation.images.exterior_image_1_left",
-            "observation.images.exterior_image_2_left",
-            "observation.images.wrist_image_left",]
+    image_keys=["exterior_image_1_left",  # observation.images.exterior_image_1_left
+                "exterior_image_2_left",
+                "wrist_image_left",]
     while done_episodes < num_episodes:
         # --------------------------------------------------------------
         # 1. Policy inference + Q-value prediction ---------------------
@@ -141,7 +141,7 @@ def run_mav_evaluation(
         # --------------------------------------------------------------
         # 2. Environment step ------------------------------------------
         # --------------------------------------------------------------
-        next_obs, reward, done, info = env.step(actions,eval=True)
+        next_obs, reward, done, info = env.step(actions)
         done_flags = done
 
         # Capture frames ------------------------------------------------

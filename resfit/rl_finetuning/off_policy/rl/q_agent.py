@@ -10,10 +10,10 @@ from contextlib import contextmanager
 import torch
 from torch import nn
 
-from resfit.rl_finetuning.config.rlpd import QAgentConfig
+from resfit.rl_finetuning.config.rlpd import QAgentConfig, SiglipEncoderConfig
 from resfit.rl_finetuning.off_policy import common_utils
 from resfit.rl_finetuning.off_policy.common_utils import utils
-from resfit.rl_finetuning.off_policy.networks.encoder import VitEncoder
+from resfit.rl_finetuning.off_policy.networks.encoder import VitEncoder, SiglipEncoder
 from resfit.rl_finetuning.off_policy.rl.actor import Actor
 from resfit.rl_finetuning.off_policy.rl.critic import Critic
 
@@ -59,7 +59,7 @@ class QAgent(nn.Module):
 
         # Build the per-camera encoders *after* `self.rl_cameras` is defined so
         # that the helper function can iterate over them.
-        self.encoders: nn.ModuleList = self._build_encoders(obs_shape)
+        self.encoders: nn.ModuleList = self._build_encoders(obs_shape)  # !!!
 
         # All encoders share the same architecture ⇒ repr / patch dim are identical.
         sample_encoder = self.encoders[0]
@@ -69,8 +69,6 @@ class QAgent(nn.Module):
         # Concatenate the patch dimension from every camera (dim=1) → overall
         # representation dimension scales linearly with #cameras.
         repr_dim = repr_dim_single * len(self.rl_cameras)
-        print("encoder output dim: ", repr_dim)
-        print("patch output dim: ", patch_repr_dim)
 
         assert len(prop_shape) == 1
         prop_dim = prop_shape[0] if cfg.use_prop else 0
@@ -151,18 +149,33 @@ class QAgent(nn.Module):
         self.train(True)
         self.to(self.cfg.device)
 
-    def _build_encoders(self, obs_shape):
-        """Constructs and returns an ``nn.ModuleList`` with one encoder per
-        camera based on ``self.cfg.enc_type``.  All encoders share the same
-        architecture and therefore yield feature tensors with identical
-        dimensions which simplifies feature fusion downstream.
-        """
+    # def _build_encoders(self, obs_shape):
+    #     """Constructs and returns an ``nn.ModuleList`` with one encoder per
+    #     camera based on ``self.cfg.enc_type``.  All encoders share the same
+    #     architecture and therefore yield feature tensors with identical
+    #     dimensions which simplifies feature fusion downstream.
+    #     """
 
+    #     encoders = nn.ModuleList()
+
+    #     for _ in self.rl_cameras:
+    #         if self.cfg.enc_type == "vit":
+    #             enc = VitEncoder(obs_shape, self.cfg.vit).to(self.cfg.device)
+    #         else:
+    #             raise AssertionError(f"Unknown encoder type {self.cfg.enc_type}.")
+
+    #         encoders.append(enc)
+
+    #     return encoders
+
+    def _build_encoders(self, obs_shape):  # !!!
         encoders = nn.ModuleList()
 
         for _ in self.rl_cameras:
             if self.cfg.enc_type == "vit":
                 enc = VitEncoder(obs_shape, self.cfg.vit).to(self.cfg.device)
+            elif self.cfg.enc_type == "siglip":
+                enc = SiglipEncoder(obs_shape, self.cfg.siglip).to(self.cfg.device)  # !!!
             else:
                 raise AssertionError(f"Unknown encoder type {self.cfg.enc_type}.")
 
@@ -208,7 +221,7 @@ class QAgent(nn.Module):
 
         self.cfg.act_method = original_method
 
-    def _encode(self, obs: dict[str, torch.Tensor], augment: bool) -> torch.Tensor:
+    def _encode(self, obs: dict[str, torch.Tensor], augment: bool) -> torch.Tensor:  # !!!
         r"""This function encodes the observation into feature tensor.
 
         Images may be stored in the replay buffers as uint8 to save GPU memory.  In
@@ -257,7 +270,7 @@ class QAgent(nn.Module):
         unsqueezed = self._maybe_unsqueeze_(obs)
 
         assert "feat" not in obs
-        obs["feat"] = self._encode(obs, augment=False)
+        obs["feat"] = self._encode(obs, augment=False)  # !!!
 
         action = self._act_default(
             obs=obs,
@@ -457,7 +470,7 @@ class QAgent(nn.Module):
         obs: dict[str, torch.Tensor] = batch["obs"]
 
         assert "feat" not in obs, "safety check"
-        obs["feat"] = self._encode(obs, augment=True)
+        obs["feat"] = self._encode(obs, augment=True)  # !!!
 
         if not backprop_encoder:
             obs["feat"] = obs["feat"].detach()
@@ -614,10 +627,10 @@ class QAgent(nn.Module):
         # To not bootstrap on terminal states we zero out the discount factor for terminal next states
         effective_discount = discount * next_nonterminal
 
-        obs["feat"] = self._encode(obs, augment=True)
+        obs["feat"] = self._encode(obs, augment=True)  # !!!
 
         with torch.no_grad():
-            next_obs["feat"] = self._encode(next_obs, augment=True)
+            next_obs["feat"] = self._encode(next_obs, augment=True)  # !!!
 
         metrics = {}
         metrics["data/batch_R"] = reward.mean().item()

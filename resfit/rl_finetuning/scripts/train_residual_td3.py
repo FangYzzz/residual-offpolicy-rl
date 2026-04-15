@@ -1004,7 +1004,7 @@ def main(cfg: ResidualTD3DexmgConfig):
                 eval_metrics = run_dexmg_evaluation(
                     env=eval_env,
                     agent=agent,
-                    num_episodes=cfg.eval_num_episodes,
+                    num_episodes=cfg.eval_num_episodes,  ###
                     device=device,
                     global_step=global_step,
                     save_video=cfg.save_video,

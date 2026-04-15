@@ -82,14 +82,14 @@ def prevent_keyboard_interrupt():
 
 
 class ResidualClient:
-    def __init__(self, main_host, main_port, action_scaler,state_standardizer):
+    def __init__(self, main_host, main_port, action_scaler, state_standardizer):
         self.device = torch.device("cuda") # cpu
         self.training = False
         self.server = f"http://{main_host}:{main_port}"
         self.action_scaler = action_scaler
         self._last_base_action = None
         self.state_standardizer = state_standardizer
-
+        self.base_action_buffer =[]
 
     def to(self, device: str | torch.device):
         self.device = torch.device(device)
@@ -150,7 +150,11 @@ class ResidualClient:
             action_base = action_base.unsqueeze(0)
 
         # 标准化后的 base action
-        base_naction = self.action_scaler.scale(action_base)
+        self.base_action_buffer.clear()
+        for action_ in action_base:
+            self.base_action_buffer.append(action_)
+        action_base_ = self.base_action_buffer.pop(0)
+        base_naction = self.action_scaler.scale(action_base_)
         self._last_base_action = base_naction
 
         # 与 offline schema 对齐
@@ -164,6 +168,8 @@ class ResidualClient:
             "wrist_image_left": obs_wrist,
             "text": text,
         }
+        if base_naction.ndim == 1:
+            base_naction = base_naction.unsqueeze(0)
 
         obs = self._augment_obs(obs, base_naction)
         return obs
@@ -195,25 +201,45 @@ class ResidualClient:
         action_base = torch.asarray(loads(resp.json()))
         return action_base
     
-    def get_online_action_base(self):
-        with prevent_keyboard_interrupt():
-            resp = requests.post(
-                f"{self.server}/query_online_action_base",
-                json={},
-                # timeout=1.0,
-            )
+    # def get_online_action_base(self):
+    #     with prevent_keyboard_interrupt():
+    #         resp = requests.post(
+    #             f"{self.server}/query_online_action_base",
+    #             json={},
+    #             # timeout=1.0,
+    #         )
         
-        action_base = torch.asarray(loads(resp.json()))
-        return action_base
+    #     action_base = torch.asarray(loads(resp.json()))
+    #     return action_base
     
     def step(self, residual_action):
+        # residual_action = torch.zeros_like(residual_action)
+        residual_action[:, -1] = 0
         combined_action = self._last_base_action + residual_action
         unscaled_combined_action = self.action_scaler.unscale(combined_action)
 
-        next_obs, reward, done = self.get_transition(combined_action=unscaled_combined_action) # TODO: terminated, truncated?
-        next_base_action = next_obs["observation.base_action"]
-        base_naction = self.action_scaler.scale(next_base_action)
+        if len(self.base_action_buffer)==0:
+            query_action_base = True
+        else:
+            query_action_base = False
         
+        next_obs, reward, done = self.get_transition(combined_action=unscaled_combined_action, query_action_base = query_action_base) # TODO: terminated, truncated?
+
+        # next_base_action = next_obs["observation.base_action"]
+        if query_action_base or done:
+            next_base_action = next_obs["observation.base_action"]
+            self.base_action_buffer.clear()
+            for action_ in next_base_action:
+                self.base_action_buffer.append(action_)
+        
+        next_base_action_ = self.base_action_buffer.pop(0)
+        base_naction = self.action_scaler.scale(next_base_action_)
+        self._last_base_action = base_naction
+        if base_naction.ndim == 1:
+            base_naction = base_naction.unsqueeze(0)
+        
+        next_obs = self._augment_obs(next_obs, base_naction)
+
         info = {}
         info["scaled_action"] = combined_action
         # info = {
@@ -221,14 +247,15 @@ class ResidualClient:
         #     "episode_steps": ,
         #     "_episode_steps": ,
         # }
-        
-        next_obs = self._augment_obs(next_obs, base_naction)
 
-        self._last_base_action = base_naction
+        print("len(self.base_action_buffer)----------------------------->", len(self.base_action_buffer))
+        print("next_base_action_  :", next_base_action_)
+        print("residual_action    :", residual_action)
+        print("combined_action    :", combined_action)
 
         return next_obs, reward, done, info
 
-    def get_transition(self, combined_action):
+    def get_transition(self, combined_action, query_action_base):
         # 转成 numpy，并去掉 batch 维
         if isinstance(combined_action, torch.Tensor):
             combined_action = combined_action.detach().cpu().numpy()  # type: torch.Tensor
@@ -243,6 +270,7 @@ class ResidualClient:
                 f"{self.server}/query_transition",
                 json={
                     "combined_action": combined_action.tolist(),
+                    "query_action_base": query_action_base,
                 },
                 timeout=60,
             )
@@ -256,20 +284,23 @@ class ResidualClient:
 
         eef_position = torch.as_tensor(np.array(raw["eef_position"]), device=self.device, dtype=torch.float32)
         gripper_position = torch.as_tensor(np.array(raw["gripper_position"]), device=self.device, dtype=torch.float32)
-        next_base_action = torch.as_tensor(np.array(raw["next_action_base"]), device=self.device, dtype=torch.float32)
+        if raw["next_action_base"] is not None:
+            next_base_action = torch.as_tensor(np.array(raw["next_action_base"]), device=self.device, dtype=torch.float32)
+        else:
+            next_base_action = None
 
         reward = torch.as_tensor(raw["reward"], device=self.device, dtype=torch.float32)
         done = torch.as_tensor(raw["done"], device=self.device, dtype=torch.bool)
 
-        # ---------- 保证都有 env 维 ----------
+        # 保证都有 env 维
         if eef_position.ndim == 1:
             eef_position = eef_position.unsqueeze(0)          # [D] -> [1, D]
         if gripper_position.ndim == 1:
             gripper_position = gripper_position.unsqueeze(0)  # [D] -> [1, D]
-        if next_base_action.ndim == 1:
-            next_base_action = next_base_action.unsqueeze(0)  # [A] -> [1, A]
+        if next_base_action is not None:
+            if next_base_action.ndim == 1:
+                next_base_action = next_base_action.unsqueeze(0)  # [A] -> [1, A]
 
-        # 图像也补 env 维
         if obs_left.ndim == 3:
             obs_left = obs_left.unsqueeze(0)      # [H, W, C] -> [1, H, W, C]
         if obs_right.ndim == 3:
