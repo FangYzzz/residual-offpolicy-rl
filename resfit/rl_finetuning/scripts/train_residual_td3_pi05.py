@@ -849,6 +849,9 @@ def main(cfg: ResidualTD3DexmgConfig):
                 done_flag = bool(sample["done"].item())
             else:
                 done_flag = False
+            
+            if done_flag:
+                print(f"episode done at {step_id}")
 
             # Generate base action based on the selected mode
             if use_base_policy_for_base_actions:
@@ -1314,6 +1317,7 @@ def main(cfg: ResidualTD3DexmgConfig):
 
     while global_step <= cfg.algo.total_timesteps:
         iter_start = time.time()
+        next_persist_threshold = len(online_rb) + cfg.save_online_rb_interval ###
         # ------------------------------------------------------------------
         # (1) Collect action + Environment step ---------------------------
         # ------------------------------------------------------------------
@@ -1373,6 +1377,26 @@ def main(cfg: ResidualTD3DexmgConfig):
             enc_type=enc_type
         )
         print("---------------------- _add_transitions_to_buffer ----------------------")
+
+        #-------------------------------------------------------------------
+        # save online_rb to the local---------------------------------------
+        #-------------------------------------------------------------------
+        if len(online_rb) >= next_persist_threshold:
+            online_cache_dir.mkdir(parents=True, exist_ok=True)
+            optimized_replay_buffer_dumps(online_rb, online_cache_dir)
+
+            with open(online_cache_dir / "user_metadata.json", "w") as f:
+                json.dump(online_cache_meta, f, indent=2)
+
+            print(
+                f"[Persist] online replay buffer dumped to {online_cache_dir}, !!!!!!!!!!!!!!!!1"
+                f"size = {len(online_rb)} transitions!!!!!!!!!!!!!!!!!!"
+            )
+
+            if ONLINE_HF_REPO is not None:
+                _hf_upload_buffer(ONLINE_HF_REPO, online_cache_dir, online_cache_hash)
+
+            next_persist_threshold += cfg.save_online_rb_interval
 
         obs = next_obs  # roll
 
