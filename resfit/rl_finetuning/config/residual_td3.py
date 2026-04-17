@@ -128,7 +128,7 @@ class ResidualTD3DexmgConfig(RLPDDexmgConfig):
     resume_checkpoint: str | None = None
     checkpoint_interval: int = 500
     save_replay_on_checkpoint: bool = False
-
+    save_online_rb_interval: int = 1000
 
 @dataclass
 class ResidualTD3CanConfig(ResidualTD3DexmgConfig):

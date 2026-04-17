@@ -185,6 +185,10 @@ class ResidualClient:
         return obs
 
     def get_offline_action_base(self, raw_obs):
+        if len(self.base_action_buffer):
+            query_action_base = True
+        else:
+            query_action_base = False
         with prevent_keyboard_interrupt():
             resp = requests.post(
                 f"{self.server}/query_offline_action_base",
@@ -194,11 +198,18 @@ class ResidualClient:
                     "exterior_image_2_left": raw_obs["exterior_image_2_left"].detach().cpu().numpy(),
                     "eef_position": raw_obs["eef_position"].detach().cpu().numpy(),
                     "gripper_position": raw_obs["gripper_position"].detach().cpu().numpy(),
+                    "query_action_base": query_action_base,
                 },
                 # timeout=1.0,
             )
-        
-        action_base = torch.asarray(loads(resp.json()))
+
+        if query_action_base:
+            self.base_action_buffer.clear()
+            action_base_chunk = torch.asarray(loads(resp.json()))
+            for action in action_base_chunk:
+                self.base_action_buffer.append(action)
+        action_base = self.base_action_buffer.pop(0)
+
         return action_base
     
     # def get_online_action_base(self):
