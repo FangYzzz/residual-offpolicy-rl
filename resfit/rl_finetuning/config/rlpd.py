@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-
+from typing import List, Optional
 from hydra.core.config_store import ConfigStore
 from torch import nn
 
@@ -84,7 +84,8 @@ class ActorConfig:
     # If None, uses default initialization. If set to a small value (e.g., 1e-3):
     # - For 'normal': used as standard deviation
     # - For 'orthogonal'/'xavier_uniform': used as gain to scale initialization close to zero
-    actor_last_layer_init_scale: float | None = None
+    # actor_last_layer_init_scale: float | None = None
+    actor_last_layer_init_scale: Optional[float] = None
     # Distribution to use for last layer initialization
     # Options: 'normal', 'orthogonal', 'xavier_uniform'
     actor_last_layer_init_distribution: str = "normal"
@@ -160,12 +161,12 @@ class RLPDAlgoConfig:
     gamma: float = 0.99
 
     # Update scheduling ------------------------------------------------------
-    num_updates_per_iteration: int = 4
-    actor_updates_per_iteration: int = 1
+    num_updates_per_iteration: int = 16 #4
+    actor_updates_per_iteration: int =4 #1
     update_every_n_steps: int = 1
 
     # Offline / online mixture ----------------------------------------------
-    offline_fraction: float = 0.5  # fraction of minibatch sampled from offline buffer
+    offline_fraction: float = 0.5  # 0.5  # fraction of minibatch sampled from offline buffer
 
     # ------------------------------------------------------------------
     # N-step returns ----------------------------------------------------
@@ -233,20 +234,27 @@ class RLPDAlgoConfig:
 @dataclass
 class OfflineDataConfig:
     name: str = "ankile/robomimic-mh-can-image"
-    num_episodes: int | None = 300
-    image_key: str | None = None
+    num_episodes: Optional[int] = 300
+    image_key: Optional[str] = None
 
+    
 
 @dataclass
 class WandBConfig:
+    # project: str = "rlpd"
+    # name: str | None = None
+    # mode: str = "online"
+    # entity: str | None = None
+    # notes: str | None = None
+    # continue_run_id: str | None = None
+    # group: str | None = None
     project: str = "rlpd"
-    name: str | None = None
-    mode: str = "online"
-    entity: str | None = None
-    notes: str | None = None
-    continue_run_id: str | None = None
-    group: str | None = None
-
+    name: Optional[str]= None
+    mode = "online"
+    entity:Optional[str] = None
+    notes:Optional[str] = None
+    continue_run_id:Optional[str] = None
+    group:Optional[str] = None
 
 # -----------------------------------------------------------------------------
 # Top-level experiment config --------------------------------------------------
@@ -256,9 +264,14 @@ class RLPDDexmgConfig:
     # ------------------------------------------------------------------
     # General
     # ------------------------------------------------------------------
-    seed: int | None = None
+    # seed: int | None = None
+    # torch_deterministic: bool = False
+    # debug: bool = False
+
+    seed: Optional[int] = None
     torch_deterministic: bool = False
     debug: bool = False
+
 
     # ------------------------------------------------------------------
     # Task / environment
@@ -269,7 +282,7 @@ class RLPDDexmgConfig:
     eval_num_episodes: int = 10  # 50
     headless: bool = True
     video_key: str = "observation.images.agentview"
-    rl_camera: list[str] = field(
+    rl_camera: List[str] = field(
         default_factory=lambda: [
             "observation.images.agentview",
             "observation.images.robot0_eye_in_hand",
@@ -289,8 +302,8 @@ class RLPDDexmgConfig:
     # ------------------------------------------------------------------
     # Offline dataset
     # ------------------------------------------------------------------
-    offline_data: OfflineDataConfig | None = field(default_factory=OfflineDataConfig)
-
+    # offline_data: OfflineDataConfig | None = field(default_factory=OfflineDataConfig)
+    offline_data: OfflineDataConfig = field(default_factory=OfflineDataConfig)
     # ------------------------------------------------------------------
     # Weights & Biases logging
     # ------------------------------------------------------------------
@@ -344,7 +357,7 @@ class RLPDBoxCleanConfig(RLPDDexmgConfig):
     wandb: WandBConfig = field(default_factory=lambda: WandBConfig(project="dexmg-box-clean-rlpd"))
 
     # Use same camera setup as residual TD3 BoxCleanup config
-    rl_camera: list[str] = field(
+    rl_camera: List[str] = field(
         default_factory=lambda: [
             "observation.images.agentview",
             "observation.images.robot0_eye_in_hand",
@@ -372,7 +385,7 @@ class RLPDCoffeeConfig(RLPDDexmgConfig):
 
     wandb: WandBConfig = field(default_factory=lambda: WandBConfig(project="dexmg-coffee-rlpd"))
 
-    rl_camera: list[str] = field(
+    rl_camera: List[str] = field(
         default_factory=lambda: [
             "observation.images.agentview",
             "observation.images.robot0_eye_in_left_hand",
@@ -401,7 +414,7 @@ class RLPDThreadingConfig(RLPDDexmgConfig):
     wandb: WandBConfig = field(default_factory=lambda: WandBConfig(project="mimicgen-threading-rlpd"))
 
     # Use single-arm camera setup for MimicGen threading task
-    rl_camera: list[str] = field(
+    rl_camera: List[str] = field(
         default_factory=lambda: [
             "observation.images.agentview",
             "observation.images.robot0_eye_in_hand",
@@ -429,7 +442,7 @@ class RLPDTwoArmThreadingConfig(RLPDDexmgConfig):
 
     wandb: WandBConfig = field(default_factory=lambda: WandBConfig(project="dexmg-threading-rlpd"))
 
-    rl_camera: list[str] = field(
+    rl_camera: List[str] = field(
         default_factory=lambda: [
             "observation.images.agentview",
             "observation.images.robot0_eye_in_hand",
@@ -457,7 +470,7 @@ class RLPDPouringConfig(RLPDDexmgConfig):
 
     wandb: WandBConfig = field(default_factory=lambda: WandBConfig(project="dexmg-pouring-rlpd"))
 
-    rl_camera: list[str] = field(
+    rl_camera: List[str] = field(
         default_factory=lambda: [
             "observation.images.agentview",
             "observation.images.robot0_eye_in_left_hand",
@@ -485,7 +498,7 @@ class RLPDLiftTrayConfig(RLPDDexmgConfig):
 
     wandb: WandBConfig = field(default_factory=lambda: WandBConfig(project="dexmg-lifttray-rlpd"))
 
-    rl_camera: list[str] = field(
+    rl_camera: List[str] = field(
         default_factory=lambda: [
             "observation.images.agentview",
             "observation.images.robot0_eye_in_hand",
@@ -513,7 +526,7 @@ class RLPDThreePieceAssemblyConfig(RLPDDexmgConfig):
 
     wandb: WandBConfig = field(default_factory=lambda: WandBConfig(project="dexmg-threepieceassembly-rlpd"))
 
-    rl_camera: list[str] = field(
+    rl_camera: List[str] = field(
         default_factory=lambda: [
             "observation.images.agentview",
             "observation.images.robot0_eye_in_hand",
@@ -541,7 +554,7 @@ class RLPDTwoArmTransportConfig(RLPDDexmgConfig):
 
     wandb: WandBConfig = field(default_factory=lambda: WandBConfig(project="dexmg-transport-rlpd"))
 
-    rl_camera: list[str] = field(
+    rl_camera: List[str] = field(
         default_factory=lambda: [
             "observation.images.shouldercamera0",
             "observation.images.shouldercamera1",
@@ -569,7 +582,7 @@ class RLPDTwoArmCanSortConfig(RLPDDexmgConfig):
 
     wandb: WandBConfig = field(default_factory=lambda: WandBConfig(project="dexmg-cansort-rlpd"))
 
-    rl_camera: list[str] = field(
+    rl_camera: List[str] = field(
         default_factory=lambda: [
             "observation.images.frontview",
             "observation.images.robot0_eye_in_left_hand",

@@ -34,53 +34,6 @@ def prevent_keyboard_interrupt():
             raise KeyboardInterrupt
 
 
-# def prepare_image_256(img: np.ndarray, size=(256, 256)) -> np.ndarray:
-#     """中心裁剪成正方形，再缩放到指定大小，输出 RGB uint8。"""
-#     if img is None:
-#         raise ValueError("Input image is None")
-#     h, w = img.shape[:2]
-#     side = min(h, w)
-#     y0 = (h - side) // 2
-#     x0 = (w - side) // 2
-#     crop = img[y0:y0 + side, x0:x0 + side]
-#     out = cv2.resize(crop, size, interpolation=cv2.INTER_AREA)
-#     return out.astype(np.uint8, copy=False)
-
-
-# def process_policy_images_from_obs(
-#     obs: dict[str, Any],
-#     external_camera_key: str = "observation.images.agentview",
-#     wrist_camera_key: str = "observation.images.robot0_eye_in_left_hand",
-# ) -> tuple[np.ndarray, np.ndarray]:
-#     """
-#     输入训练/评估里常见的 observation dict，输出 Flower server 需要的两张 224x224 图。
-#     """
-#     primary_image = obs[external_camera_key]
-#     wrist_image = obs[wrist_camera_key]
-
-#     if isinstance(primary_image, torch.Tensor):
-#         primary_image = primary_image.detach().cpu().numpy()
-#     if isinstance(wrist_image, torch.Tensor):
-#         wrist_image = wrist_image.detach().cpu().numpy()
-
-#     primary_image = np.asarray(primary_image)
-#     wrist_image = np.asarray(wrist_image)
-
-#     # 支持 CHW -> HWC
-#     if primary_image.ndim == 3 and primary_image.shape[0] in (1, 3):
-#         primary_image = np.transpose(primary_image, (1, 2, 0))
-#     if wrist_image.ndim == 3 and wrist_image.shape[0] in (1, 3):
-#         wrist_image = np.transpose(wrist_image, (1, 2, 0))
-
-#     primary_image = prepare_image_256(primary_image)
-#     wrist_image = prepare_image_256(wrist_image)
-
-#     primary_resized = image_tools.resize_with_pad(primary_image, 224, 224)
-#     wrist_resized = image_tools.resize_with_pad(wrist_image, 224, 224)
-
-#     return primary_resized, wrist_resized
-
-
 class ResidualClient:
     def __init__(self, main_host, main_port, action_scaler, state_standardizer):
         self.device = torch.device("cuda") # cpu
@@ -174,18 +127,18 @@ class ResidualClient:
         obs = self._augment_obs(obs, base_naction)
         return obs
 
-    def get_curr_obs(self):
-        with prevent_keyboard_interrupt():
-            resp = requests.post(
-                f"{self.server}/query_curr_obs",
-                json={},
-                # timeout=1.0,
-            )
-        obs = np.array(loads(resp.json()))
-        return obs
+    # def get_curr_obs(self):
+    #     with prevent_keyboard_interrupt():
+    #         resp = requests.post(
+    #             f"{self.server}/query_curr_obs",
+    #             json={},
+    #             # timeout=1.0,
+    #         )
+    #     obs = np.array(loads(resp.json()))
+    #     return obs
 
     def get_offline_action_base(self, raw_obs):
-        if len(self.base_action_buffer):
+        if len(self.base_action_buffer)==0:
             query_action_base = True
         else:
             query_action_base = False
@@ -212,17 +165,28 @@ class ResidualClient:
 
         return action_base
     
-    # def get_online_action_base(self):
-    #     with prevent_keyboard_interrupt():
-    #         resp = requests.post(
-    #             f"{self.server}/query_online_action_base",
-    #             json={},
-    #             # timeout=1.0,
-    #         )
-        
-    #     action_base = torch.asarray(loads(resp.json()))
-    #     return action_base
+    def start_warmup(self):
+        with prevent_keyboard_interrupt():
+            resp = requests.post(
+                f"{self.server}/start_move",
+                json={
+                    "online_warmup": True,
+                    "online_move": False,
+                },
+                # timeout=1.0,
+            )
     
+    def start_online_train(self):
+        with prevent_keyboard_interrupt():
+            resp = requests.post(
+                f"{self.server}/start_move",
+                json={
+                    "online_warmup": False,
+                    "online_move": True,
+                },
+                # timeout=1.0,
+            )
+
     def step(self, residual_action):
         # residual_action = torch.zeros_like(residual_action)
         residual_action[:, -1] = 0

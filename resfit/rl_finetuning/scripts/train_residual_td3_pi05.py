@@ -1051,15 +1051,11 @@ def main(cfg: ResidualTD3DexmgConfig):
             # line4: Observe next state st+1, reward rt, done flag dt
             # next_obs, reward, terminated, truncated, info = env.step(rand_actions)  # line3: Step env with at = εt + atb where atb ∼ πb(st)
 
-            # next_obs, base_action, reward, terminated, truncated, info = base_policy.step(residual_action=rand_actions) # todo need to return  reward, terminated, truncated, info  normalize 
-            # done = terminated | truncated
             next_obs, reward, done, info = base_policy.step(residual_action=rand_actions) # todo need to return  reward, terminated, truncated, info  normalize 
             # print(f"[warmup] after step: reward={reward}, done={done}")
 
             reward_sum += reward.sum().item()
             episode_count += done.float().sum().item()
-            # reward_sum += reward
-            # episode_count += int(done)
 
             # Use the executed combined action returned by the environment
             combined_action = info["scaled_action"]
@@ -1182,50 +1178,6 @@ def main(cfg: ResidualTD3DexmgConfig):
         agent, online_rb, offline_rb, cfg, device, training_timer, online_batch_size, offline_batch_size
     ):
         """Run critic-only updates for warmup phase."""
-        # def print_leaf_shapes(td, name):
-        #     print(f"\n===== {name} =====")
-        #     for key, value in td.items(include_nested=True, leaves_only=True):
-        #         if hasattr(value, "shape"):
-        #             print(f"{key}: shape={tuple(value.shape)}, dtype={value.dtype}")
-        #         else:
-        #             print(f"{key}: type={type(value)}")
-
-        # def compare_td_shapes(td1, td2, name1="online", name2="offline"):
-        #     d1 = {}
-        #     d2 = {}
-
-        #     for key, value in td1.items(include_nested=True, leaves_only=True):
-        #         d1[str(key)] = tuple(value.shape) if hasattr(value, "shape") else str(type(value))
-
-        #     for key, value in td2.items(include_nested=True, leaves_only=True):
-        #         d2[str(key)] = tuple(value.shape) if hasattr(value, "shape") else str(type(value))
-
-        #     all_keys = sorted(set(d1.keys()) | set(d2.keys()))
-        #     print("\n===== SHAPE MISMATCH CHECK =====")
-        #     for k in all_keys:
-        #         s1 = d1.get(k, None)
-        #         s2 = d2.get(k, None)
-        #         if s1 != s2:
-        #             print(f"{k}: {name1}={s1}, {name2}={s2}")
-
-        # for i in range(cfg.algo.critic_warmup_steps):
-        #     with training_timer.time("batch_sampling"):
-        #         online_batch = online_rb.sample(online_batch_size)
-        #         online_batch = online_batch.to(device, non_blocking=True)
-
-        #         if cfg.algo.offline_fraction > 0.0:
-        #             offline_batch = offline_rb.sample(offline_batch_size)
-        #             offline_batch = offline_batch.to(device, non_blocking=True)
-
-        #             # 只在第一次 warmup 时打印，避免刷屏
-        #             if i == 0:
-        #                 print_leaf_shapes(online_batch, "ONLINE")
-        #                 print_leaf_shapes(offline_batch, "OFFLINE")
-        #                 compare_td_shapes(online_batch, offline_batch)
-
-        #             batch = torch.cat([online_batch, offline_batch], dim=0)
-        #         else:
-        #             batch = online_batch
         for i in range(cfg.algo.critic_warmup_steps):
             # Sample mixed online/offline batch
             with training_timer.time("batch_sampling"):
@@ -1314,10 +1266,10 @@ def main(cfg: ResidualTD3DexmgConfig):
             offline_batch_size=offline_batch_size,
         )
         print("Critic warmup completed.")
-
+    next_persist_threshold = len(online_rb) + cfg.save_online_rb_interval ###
     while global_step <= cfg.algo.total_timesteps:
         iter_start = time.time()
-        next_persist_threshold = len(online_rb) + cfg.save_online_rb_interval ###
+        
         # ------------------------------------------------------------------
         # (1) Collect action + Environment step ---------------------------
         # ------------------------------------------------------------------
@@ -1422,7 +1374,7 @@ def main(cfg: ResidualTD3DexmgConfig):
                 if current_success_rate > best_eval_success_rate:
                     print(f"🎉 New best success rate: {current_success_rate:.4f} (prev: {best_eval_success_rate:.4f})")
                     best_eval_success_rate = current_success_rate
-
+            obs = base_policy.reset()
         global_step += cfg.num_envs
 
         # ------------------------------------------------------------------

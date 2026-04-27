@@ -119,16 +119,17 @@ class ResidualTD3DexmgConfig(RLPDDexmgConfig):
     # ------------------------------------------------------------------
     # Logging / checkpointing
     # ------------------------------------------------------------------
-    eval_interval_every_steps: int = 3000  # 10_000
+    eval_interval_every_steps: int = 10_000  ### 10_000
 
     # Whether to run an evaluation pass before training begins (at step 0)
     eval_first: bool = True
 
     resume: bool = False
     resume_checkpoint: str | None = None
-    checkpoint_interval: int = 500
+    checkpoint_interval: int = 10000  ###
     save_replay_on_checkpoint: bool = False
-    save_online_rb_interval: int = 1000
+    save_online_rb_interval: int = 5000  ###
+    send_transitions_len : int = 1  ### 
 
 @dataclass
 class ResidualTD3CanConfig(ResidualTD3DexmgConfig):
@@ -211,9 +212,9 @@ class ResidualTD3FrankaTomatoConfig(ResidualTD3DexmgConfig):
 
     rl_camera: list[str] = field(
         default_factory=lambda: [
-            "exterior_image_1_left",
-            "exterior_image_2_left",
-            "wrist_image_left",
+            "observation.images.exterior_image_1_left",
+            "observation.images.exterior_image_2_left",
+            "observation.images.wrist_image_left",
         ]
     )
 

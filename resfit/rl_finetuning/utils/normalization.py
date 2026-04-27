@@ -166,7 +166,8 @@ class ActionScaler:
         """
         action_min = torch.tensor(action_stats["min"], dtype=torch.float32)
         action_max = torch.tensor(action_stats["max"], dtype=torch.float32)
-
+        print(f"action_min: {action_min}")
+        print(f"action_max: {action_max}")
         return cls(
             action_min=action_min,
             action_max=action_max,
@@ -258,7 +259,8 @@ class StateStandardizer:
         """
         state_mean = torch.tensor(state_stats["mean"], dtype=torch.float32)
         state_std = torch.tensor(state_stats["std"], dtype=torch.float32)
-
+        print(f"state_mean: {state_mean}")
+        print(f"state_std: {state_std}")
         return cls(
             state_mean=state_mean,
             state_std=state_std,

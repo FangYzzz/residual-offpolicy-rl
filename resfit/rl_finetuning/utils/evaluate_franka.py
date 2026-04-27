@@ -119,9 +119,9 @@ def run_franka_evaluation(
     # Initialize progress display with dots
     progress_dots = ["."] * num_episodes
     print(f"Evaluating {num_episodes} episodes: {''.join(progress_dots)}", end="", flush=True)
-    image_keys=["exterior_image_1_left",  # observation.images.exterior_image_1_left
-                "exterior_image_2_left",
-                "wrist_image_left",]
+    image_keys=["observation.images.exterior_image_1_left",  # observation.images.exterior_image_1_left
+                "observation.images.exterior_image_2_left",
+                "observation.images.wrist_image_left",]
     while done_episodes < num_episodes:
         # --------------------------------------------------------------
         # 1. Policy inference + Q-value prediction ---------------------

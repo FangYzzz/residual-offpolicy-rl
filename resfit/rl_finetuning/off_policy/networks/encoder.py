@@ -11,7 +11,7 @@ from resfit.rl_finetuning.off_policy.networks.min_vit import MinVit
 from dataclasses import dataclass
 
 import torch.nn.functional as F
-from transformers import SiglipImageProcessor, SiglipVisionModel
+# from transformers import SiglipImageProcessor, SiglipVisionModel
 
 
 class VitEncoder(nn.Module):
