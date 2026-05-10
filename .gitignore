@@ -8,3 +8,5 @@ bc_run_*
 run_*
 deps/
 *.log
+.env
+**/.env
