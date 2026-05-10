@@ -217,6 +217,8 @@ class ResidualClient:
 
         info = {}
         info["scaled_action"] = combined_action
+        info["combined_action"] = unscaled_combined_action
+        info["residual_action"] = residual_action
         # info = {
         #     "scaled_action": combined_action,
         #     "episode_steps": ,

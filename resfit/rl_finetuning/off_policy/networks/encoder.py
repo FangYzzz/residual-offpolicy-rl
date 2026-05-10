@@ -11,7 +11,7 @@ from resfit.rl_finetuning.off_policy.networks.min_vit import MinVit
 from dataclasses import dataclass
 
 import torch.nn.functional as F
-# from transformers import SiglipImageProcessor, SiglipVisionModel
+from transformers import SiglipImageProcessor, SiglipVisionModel
 
 
 class VitEncoder(nn.Module):
@@ -156,6 +156,25 @@ class SiglipEncoder(nn.Module):  # !!!
             feats = feats.flatten(1, 2)  # [B, N, D] -> [B, N*D]
 
         return feats
+    
+    # def forward(self, obs: torch.Tensor, flatten: bool = True) -> torch.Tensor:
+    #     obs = self._preprocess(obs)
+
+    #     if self.cfg.freeze:
+    #         with torch.no_grad():
+    #             outputs = self.vision_model(pixel_values=obs)
+    #             feats = outputs.last_hidden_state
+    #     else:
+    #         outputs = self.vision_model(pixel_values=obs)
+    #         feats = outputs.last_hidden_state
+
+    #     if self.cfg.drop_cls_token and feats.shape[1] == self.num_patch + 1:
+    #         feats = feats[:, 1:, :]
+
+    #     if flatten:
+    #         feats = feats.flatten(1, 2)
+
+    #     return feats
 
 
 # if __name__ == "__main__":
@@ -164,12 +183,15 @@ class SiglipEncoder(nn.Module):  # !!!
 #         model_name: str = "google/siglip-base-patch16-224"
 #         freeze: bool = True
 #         force_image_size: int = 224
+#         # force_image_size: int = 84
 #         use_processor_norm: bool = True
 #         drop_cls_token: bool = True
 
 #     encoder = SiglipEncoder(obs_shape=(3, 224, 224), cfg=DummyCfg())
+#     # encoder = SiglipEncoder(obs_shape=(3, 84, 84), cfg=DummyCfg())
 
 #     obs = torch.rand(10, 3, 224, 224)
+#     # obs = torch.rand(10, 3, 84, 84)
 #     feats = encoder(obs)
 #     feats = feats.mean(dim=1)  # [B, D]
 

@@ -45,7 +45,7 @@ def prevent_keyboard_interrupt():
             raise KeyboardInterrupt
 
 class Args:
-    max_timesteps: int = 200  # 90  # 180   
+    max_timesteps: int = 140 # 160 # 200 # 180   
 
     # GPT server(task_reward_generation_zedx.py)
     gpt_host: str = "127.0.0.1"  # 机器 IP
@@ -70,7 +70,8 @@ class BasePolicy:
         self.env = RobotEnv(action_space="cartesian_position", gripper_action_space="position")
         self.args = args
         self.pi05_client = websocket_client_policy.WebsocketClientPolicy(args.pi05_host, args.pi05_port)
-        self.text = "pick up the tomato and place it into the bowl"
+        # self.text = "pick up the tomato and place it into the bowl"
+        self.text = "pick up the cube and place it into the bowl"
         self.max_timesteps = args.max_timesteps
         self.t_step = 0
         self.round = 0
@@ -130,62 +131,50 @@ class BasePolicy:
             cv2.imwrite(path, img_to_save)
 
     def get_obs_for_base(self):
-       
         obs_left = copy.deepcopy(self.obs["left_image"])
         obs_right = copy.deepcopy(self.obs["right_image"])
         obs_wrist = copy.deepcopy(self.obs["wrist_image"])
         eef_pose = copy.deepcopy(self.obs["cartesian_position"]) # [x, y, z, roll, pitch, yaw]
+        gripper_position = copy.deepcopy(self.obs["gripper_position"])
+        
         self.eefpose = copy.deepcopy(eef_pose)
+
+        eef_pos = eef_pose[:3]
         eef_rpy = eef_pose[3:6]  # [x, y, z, roll, pitch, yaw]
         eef_quat = R.from_euler('xyz', eef_rpy, degrees=False).as_quat()
-        eef_pose = np.concatenate([eef_pose[:3], eef_quat], axis=-1)
-        gripper_position = copy.deepcopy(self.obs["gripper_position"])
-
+        if eef_quat[3] < 0:  # 统一四元数符号，避免跳变
+            eef_quat = -eef_quat
+        eef_pose_quat = np.concatenate([eef_pos, eef_quat], axis=-1)
 
         obs_left = prepare_image_256(obs_left)
         obs_right = prepare_image_256(obs_right)
         obs_wrist = prepare_image_256(obs_wrist)
         self.save_debug_images(obs_left, obs_right, obs_wrist)
+
         return{
-                "observation/exterior_image_1_left": image_tools.resize_with_pad(obs_left, 224, 224),
-                "observation/wrist_image_left": image_tools.resize_with_pad(obs_right, 224, 224),
-                "observation/exterior_image_2_left": image_tools.resize_with_pad(obs_wrist, 224, 224),
-                "observation/eef_position": eef_pose,
-                "observation/gripper_position": gripper_position,
-                "prompt": self.text,  # instruction
-            }
+            "observation/exterior_image_1_left": image_tools.resize_with_pad(obs_left, 224, 224),
+            "observation/wrist_image_left": image_tools.resize_with_pad(obs_right, 224, 224),
+            "observation/exterior_image_2_left": image_tools.resize_with_pad(obs_wrist, 224, 224),
+            "observation/eef_position": eef_pose_quat,
+            "observation/gripper_position": gripper_position,
+            "prompt": self.text,  # instruction
+        }
     
     def get_obs_for_residual(self, base_naction):
-        cartesian_position = copy.deepcopy(np.asarray(self.obs["cartesian_position"], dtype=np.float32))
-        pos = cartesian_position[:3]
-        rpy = cartesian_position[3:6]
-
-        quat = R.from_euler('xyz', rpy, degrees=False).as_quat()  # [qx, qy, qz, qw]
-
-        # 可选：统一四元数符号，避免跳变
-        if quat[3] < 0:
-            quat = -quat
-
-        eef_position_quat = np.concatenate([pos, quat], axis=-1)
+        obs_left = torch.as_tensor(prepare_image_256(to_hwc(copy.deepcopy(self.obs["left_image"]))), dtype=torch.uint8, device=self.device)
+        obs_right = torch.as_tensor(prepare_image_256(to_hwc(copy.deepcopy(self.obs["right_image"]))), dtype=torch.uint8, device=self.device)
+        obs_wrist = torch.as_tensor(prepare_image_256(to_hwc(copy.deepcopy(self.obs["wrist_image"]))), dtype=torch.uint8, device=self.device)
+        eef_pose = copy.deepcopy(np.asarray(self.obs["cartesian_position"], dtype=np.float32))
         gripper_position = self.obs["gripper_position"]
         
-        # obs_left = torch.as_tensor(copy.deepcopy(self.obs["left_image"]), device=self.device)
-        # obs_right = torch.as_tensor(copy.deepcopy(self.obs["right_image"]), device=self.device)
-        # obs_wrist = torch.as_tensor(copy.deepcopy(self.obs["wrist_image"]), device=self.device)
+        eef_pos = eef_pose[:3]
+        eef_rpy = eef_pose[3:6]
+        eef_quat = R.from_euler('xyz', eef_rpy, degrees=False).as_quat()  # [qx, qy, qz, qw]
+        if eef_quat[3] < 0:  # 统一四元数符号，避免跳变
+            eef_quat = -eef_quat
+        eef_pose_quat = np.concatenate([eef_pos, eef_quat], axis=-1)
 
-        # obs_left = torch.as_tensor(prepare_image_256(obs_left), device=self.device)
-        # obs_right = torch.as_tensor(prepare_image_256(obs_right), device=self.device)
-        # obs_wrist = torch.as_tensor(prepare_image_256(obs_wrist), device=self.device)
-
-        obs_left_np = prepare_image_256(to_hwc(copy.deepcopy(self.obs["left_image"])))
-        obs_right_np = prepare_image_256(to_hwc(copy.deepcopy(self.obs["right_image"])))
-        obs_wrist_np = prepare_image_256(to_hwc(copy.deepcopy(self.obs["wrist_image"])))
-
-        obs_left = torch.as_tensor(obs_left_np, dtype=torch.uint8, device=self.device)
-        obs_right = torch.as_tensor(obs_right_np, dtype=torch.uint8, device=self.device)
-        obs_wrist = torch.as_tensor(obs_wrist_np, dtype=torch.uint8, device=self.device)
-
-        eef_position_quat = torch.as_tensor(eef_position_quat, dtype=torch.float32, device=self.device)
+        eef_pose_quat = torch.as_tensor(eef_pose_quat, dtype=torch.float32, device=self.device)
         gripper_position = torch.as_tensor(gripper_position, dtype=torch.float32, device=self.device)
         base_naction = torch.as_tensor(base_naction, dtype=torch.float32, device=self.device)
 
@@ -196,14 +185,14 @@ class BasePolicy:
         if obs_wrist.ndim == 3:
             obs_wrist = obs_wrist.unsqueeze(0)
 
-        if eef_position_quat.ndim == 1:
-            eef_position_quat = eef_position_quat.unsqueeze(0)
+        if eef_pose_quat.ndim == 1:
+            eef_pose_quat = eef_pose_quat.unsqueeze(0)
         if gripper_position.ndim == 1:
             gripper_position = gripper_position.unsqueeze(0)
         if base_naction.ndim == 1:
             base_naction = base_naction.unsqueeze(0)
 
-        state = torch.cat([eef_position_quat, gripper_position], dim=-1).to(self.device)
+        state = torch.cat([eef_pose_quat, gripper_position], dim=-1).to(self.device)
 
         obs = {
             "observation.state": state,
@@ -280,7 +269,7 @@ class BasePolicy:
             pred_action_chunk = self.pi05_client.infer(request_data)["actions"]
             assert pred_action_chunk.shape == (50, 8) # 10,8
             # action = pred_action_chunk[0]
-            action = pred_action_chunk[:20]  # 20
+            action = pred_action_chunk[:35]  # 30 # 20
             # action = action[::2]
 
             action = np.asarray(action).copy()
@@ -304,8 +293,8 @@ class BasePolicy:
         pred_action_chunk = self.pi05_client.infer(obs_for_pi0)["actions"]
         assert pred_action_chunk.shape == (50, 8) # 10,8
         # action = pred_action_chunk[0]
-        action = pred_action_chunk[:20]  # 20
-        # action = action[::2]
+        action = pred_action_chunk[:35]  # 30 # 20
+        # action = action[::2]   # down sampling ferequency
 
         action = np.asarray(action).copy()
         action[:, -1] = (action[:, -1] > 0.9).astype(action.dtype) # 0.6 0.5
@@ -358,6 +347,8 @@ class BasePolicy:
         
         info = {}
         info["scaled_action"] = combined_action
+        info["combined_action"] = unscaled_combined_action
+        info["residual_action"] = residual_action
 
         reward = torch.as_tensor([reward], dtype=torch.float32, device=self.device)
         done = torch.as_tensor([done], dtype=torch.bool, device=self.device)

@@ -3,6 +3,7 @@ import numpy as np
 
 class ZEDStreamer:
     def __init__(self):
+    # def __init__(self, exposure=40, gain=50, auto_exposure=False):
         self.sl = sl  # Store module for later use
         self.zed = self.sl.Camera()
         self.init_params = self.sl.InitParameters()
@@ -11,7 +12,11 @@ class ZEDStreamer:
         self.depth = self.sl.Mat()
         self.close = 0.1
         self.far = 3.0
-        self.started = False    
+        self.started = False
+
+        # self.exposure = exposure
+        # self.gain = gain
+        # self.auto_exposure = auto_exposure    
 
     def start(self, stream_ip = '192.168.55.1', stream_port = 30000):
         # initial params
@@ -23,6 +28,22 @@ class ZEDStreamer:
         err = self.zed.open(self.init_params)
         if err != self.sl.ERROR_CODE.SUCCESS:
             raise RuntimeError(f"Failed to open ZED camera: {err}")
+        
+        # # ==============================
+        # # 设置 ZED 曝光和增益
+        # if self.auto_exposure:
+        #     self.zed.set_camera_settings(self.sl.VIDEO_SETTINGS.AEC_AGC, 1)
+        # else:
+        #     self.zed.set_camera_settings(self.sl.VIDEO_SETTINGS.AEC_AGC, 0)
+        #     self.zed.set_camera_settings(self.sl.VIDEO_SETTINGS.EXPOSURE, self.exposure)
+        #     self.zed.set_camera_settings(self.sl.VIDEO_SETTINGS.GAIN, self.gain)
+
+        # # 可选：打印检查一下当前值
+        # err_exp, exposure = self.zed.get_camera_settings(self.sl.VIDEO_SETTINGS.EXPOSURE)
+        # err_gain, gain = self.zed.get_camera_settings(self.sl.VIDEO_SETTINGS.GAIN)
+
+        # print(f"ZED exposure: {exposure}, gain: {gain}")
+        # # ==============================
 
         calib = self.zed.get_camera_information().camera_configuration.calibration_parameters
         fx, fy = calib.left_cam.fx, calib.left_cam.fy

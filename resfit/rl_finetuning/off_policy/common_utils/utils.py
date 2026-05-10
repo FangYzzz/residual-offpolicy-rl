@@ -170,11 +170,11 @@ class TruncatedNormal(pyd.Normal):
         if sample_shape is None:
             sample_shape = torch.Size()
         shape = self._extended_shape(sample_shape)
-        eps = _standard_normal(shape, dtype=self.loc.dtype, device=self.loc.device)
+        eps = _standard_normal(shape, dtype=self.loc.dtype, device=self.loc.device)  # 采样标准正态/高斯噪声 eps ~ N(0, self.scale^2)
         eps *= self.scale
         if clip is not None:
             eps = torch.clamp(eps, -clip, clip)
-        x = self.loc + eps
+        x = self.loc + eps  # action = scaled_mu(in actor.py) + N(0, self.scale^2)
         x = self._clamp(x)
         if self.max_action_norm > 0:
             x = clip_action_norm(x, self.max_action_norm)

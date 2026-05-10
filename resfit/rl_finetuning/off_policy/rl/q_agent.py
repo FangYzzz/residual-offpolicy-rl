@@ -248,7 +248,7 @@ class QAgent(nn.Module):
             feats.append(feat_cam)
 
         # Concatenate along the *patch* dimension (dim=1)
-        feat_all = torch.cat(feats, dim=1)
+        feat_all = torch.cat(feats, dim=1)  # 多相机融合后的视觉特征 [B, 3N, D]
         return feat_all  # noqa: RET504
 
     def _maybe_unsqueeze_(self, obs):
@@ -298,7 +298,7 @@ class QAgent(nn.Module):
         use_target: bool,
     ) -> torch.Tensor:
         actor = self.actor_target if use_target else self.actor
-        dist = actor.forward(obs, stddev)
+        dist = actor.forward(obs, stddev)  # action distribution
 
         # Only assert not training when this is called from the public act() method
         # (which is used for actual evaluation), not when called internally during training
@@ -306,9 +306,9 @@ class QAgent(nn.Module):
             assert not self.training
 
         if eval_mode:
-            action = dist.mean
+            action = dist.mean  # 直接用均值动作，不采样噪声
         else:
-            action = dist.sample(clip=clip)
+            action = dist.sample(clip=clip)  # 在均值动作上加噪声 esp
 
         return action
 
@@ -627,7 +627,7 @@ class QAgent(nn.Module):
         # To not bootstrap on terminal states we zero out the discount factor for terminal next states
         effective_discount = discount * next_nonterminal
 
-        obs["feat"] = self._encode(obs, augment=True)  # !!!
+        obs["feat"] = self._encode(obs, augment=True)  # !!!  多相机融合后的视觉特征
 
         with torch.no_grad():
             next_obs["feat"] = self._encode(next_obs, augment=True)  # !!!

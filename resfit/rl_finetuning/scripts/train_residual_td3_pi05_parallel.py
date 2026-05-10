@@ -185,7 +185,8 @@ def process_image_batch(obs_dict, image_keys, enc_type= "vit", rb=False):
     imgs = torch.stack(imgs, dim=0)
     
     # 只有尺寸不匹配时才 resize
-    out_size = 224 if enc_type == "siglip" else 84  # cfg.agent.enc_type == "vit"
+    out_size = 224 if enc_type == "siglip" else 84  # cfg.agent.enc_type == "vit"  # !!!
+    # out_size = 84
     if imgs.shape[-2] != out_size or imgs.shape[-1] != out_size:
         imgs = F.interpolate(
             imgs,
@@ -461,8 +462,8 @@ def collector_loop(
                     action = agent.act(obs_act, eval_mode=False, stddev=stddev, cpu=False)
 
                 if cfg.algo.progressive_clipping_steps > 0:
-                    clip_factor = min(1.0, global_step / cfg.algo.progressive_clipping_steps)
-                    action = action * clip_factor
+                    clip_factor = min(1.0, global_step / cfg.algo.progressive_clipping_steps)  # 训练一开始不要让 residual action 太大，而是慢慢放开
+                    action = action * clip_factor  # 让 residual policy 在训练早期影响较小，避免一开始破坏 base policy
 
                 next_obs, reward, done, info = base_policy.step(residual_action=action)
 
@@ -470,7 +471,7 @@ def collector_loop(
                     episode_count += done.float().sum().item()
                     episode_done = True
 
-                # 注意：这里先不 add_to_buffer，而是存起来
+                # 注意：这里先不 add_to_buffer，而是存起来（仍然是一步）
                 step_payload = {
                     "obs": obs,
                     "next_obs": next_obs,
@@ -479,12 +480,10 @@ def collector_loop(
                     "done": done,
                     "info": info,
                 }
-                episode_steps.append(step_payload)
-
+                episode_steps.append(step_payload)  # append 一步
                 obs = next_obs
-                
 
-            # 收集 一定数量后 发给learner
+            # 每收集一步就发给 learner
             ep_payload = {
                 "episode_idx": episode_idx,
                 "global_step_after_episode": global_step,
@@ -492,7 +491,6 @@ def collector_loop(
                 "steps": episode_steps,
             }
             
-
             episode_queue.put(ep_payload)
             print(f"[collector] pushed episode {episode_idx}, len={len(episode_steps)}, global_step={global_step}")
 
@@ -558,6 +556,7 @@ def learner_loop(
         online_batch_size = int(cfg.algo.batch_size * (1 - cfg.algo.offline_fraction))
         offline_batch_size = int(cfg.algo.batch_size * cfg.algo.offline_fraction)
         next_persist_threshold = len(online_rb) + cfg.save_online_rb_interval
+        
         # 一开始把初始 actor 发给 collector
         weights_queue.put({
             "actor": {k: v.detach().cpu() for k, v in agent.actor.state_dict().items()}
@@ -575,7 +574,7 @@ def learner_loop(
                 pass
             weights_queue.put(payload)
         
-
+        len_rb = len(online_rb)
         while (not stop_event.is_set()) or (not episode_queue.empty()):
             iter_start = time.time()
 
@@ -609,19 +608,18 @@ def learner_loop(
                     online_rb=online_rb,
                     enc_type=enc_type,
                 )
+                len_rb+=1
 
-
-            if len(online_rb) >= next_persist_threshold:
+            print(f"next_persist_threshold: {next_persist_threshold} !!!!!!!!!!!!!!!!!!!! ")
+            print(f"len of online rb:   {len_rb} !!!!!!!!!!!!!")
+            if len_rb >= next_persist_threshold:
                 online_cache_dir.mkdir(parents=True, exist_ok=True)
                 optimized_replay_buffer_dumps(online_rb, online_cache_dir)
-
                 with open(online_cache_dir / "user_metadata.json", "w") as f:
                     json.dump(online_cache_meta, f, indent=2)
-
-                print(
-                    f"[Persist] online replay buffer dumped to {online_cache_dir}, !!!!!!!!!!!!!!!!1"
-                    f"size = {len(online_rb)} transitions!!!!!!!!!!!!!!!!!!"
-                )
+                if ONLINE_HF_REPO is not None:
+                    _hf_upload_buffer(ONLINE_HF_REPO, online_cache_dir, online_cache_hash)
+                print(f"Update online rb. Online buffer size = {len(online_rb)} transitions")
 
                 if ONLINE_HF_REPO is not None:
                     _hf_upload_buffer(ONLINE_HF_REPO, online_cache_dir, online_cache_hash)

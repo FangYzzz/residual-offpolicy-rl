@@ -46,6 +46,7 @@ class TaskRewardGenerator:
         self.zed = None
         # self.camera = None
         self.camera = ZEDStreamer()
+        # self.camera = ZEDStreamer(exposure=40, gain=50, auto_exposure=False)
         self.camera.start(stream_ip=zed_stream_ip, stream_port=zed_stream_port)
         self.image = None
 
@@ -79,11 +80,11 @@ class TaskRewardGenerator:
         self.img_rgb = None
 
         self.candidate_tasks = [
-            "pick up the tomato and place it into the bowl"
-            "pick up the tomato from the bowl and place it in front of the bowl"
-            "pick up the tomato from the bowl and place it behind the bowl"
-            "pick up the tomato from the bowl and place it to the left of the bowl"
-            "pick up the tomato from the bowl and place it to the right of the bowl"
+            "pick up the cube and place it into the bowl"
+            # "pick up the cube from the bowl and place it in front of the bowl"
+            # "pick up the cube from the bowl and place it behind the bowl"
+            # "pick up the cube from the bowl and place it to the left of the bowl"
+            # "pick up the cube from the bowl and place it to the right of the bowl"
         ]
 
     def setup_logger(self):
@@ -190,9 +191,9 @@ class TaskRewardGenerator:
         save_dir = f"outputs/task_reward_generation/{self.timestamp}"
         os.makedirs(save_dir, exist_ok=True)
         if before == True:
-            save_path = os.path.join(save_dir, f"0_annotated_image_{self.round}_before.jpg")
+            save_path = os.path.join(save_dir, f"annotated_image_{self.round}_0_before.jpg")
         else:
-            save_path = os.path.join(save_dir, f"1_annotated_image_{self.round}_after.jpg")
+            save_path = os.path.join(save_dir, f"annotated_image_{self.round}_1_after.jpg")
         cv2.imwrite(save_path, annotated_frame)
 
         scene_gdino = self.encode_image(save_path)
@@ -320,6 +321,7 @@ class TaskRewardGenerator:
         self.scene_after = self.gdino(next_scene_dino, before=False)
 
         reward = self.reward_generator(self.scene_before, self.scene_after, self.selected_task)
+        logger.info(f"Reward: {reward}")
         
         # self.round += 1
         # self.img_rgb = img_rgb

@@ -169,7 +169,7 @@ class Actor(nn.Module):
 
         # Scale the mean by action_scale
         # NOTE: std is already in environment action space (more interpretable)
-        scaled_mu = mu * self.cfg.action_scale
+        scaled_mu = mu * self.cfg.action_scale  # !!!
 
         # Create distribution with scaled mean but environment-scale std
         action_dist = utils.TruncatedNormal(scaled_mu, std)

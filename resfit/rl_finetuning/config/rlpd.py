@@ -26,6 +26,7 @@ class SiglipEncoderConfig:
     model_name: str = "google/siglip-base-patch16-224"
     freeze: bool = True
     force_image_size: int = 224
+    # force_image_size: int = 84
     use_processor_norm: bool = False
     drop_cls_token: bool = False
 
@@ -44,7 +45,7 @@ class CriticLossCfg:
 
 @dataclass
 class CriticConfig:
-    drop: float = 0
+    drop: float = 0.2 ###0
     feature_dim: int = 128
     fuse_patch: int = 1
     hidden_dim: int = 1024
@@ -59,7 +60,7 @@ class CriticConfig:
     # "min_random_pair" (min of 2 random heads) or "q1" (just use q1 from ensemble, standard TD3)
     policy_gradient_type: str = "ensemble_mean"
     # Number of hidden layers in the critic MLP heads (default 2 for backwards compatibility)
-    num_layers: int = 2
+    num_layers: int =4 ###2
     # Layer normalization control
     use_layer_norm: bool = True
     # Number of Q-heads to take min over for target computation (default 2 for RED-Q behavior)
@@ -75,7 +76,7 @@ class CriticConfig:
 class ActorConfig:
     feature_dim: int = 128
     hidden_dim: int = 1024
-    dropout: float = 0
+    dropout: float = 0.2 ### 0
     orth: int = 1
     max_action_norm: float = -1
     spatial_emb: int = 0
@@ -97,7 +98,7 @@ class ActorConfig:
     action_l2_reg_weight: float = 0.0
     action_scale: float = 1.0
     # Number of hidden layers in the actor MLP (default 2 for backwards compatibility)
-    num_layers: int = 2
+    num_layers: int = 4 ###2
     # Layer normalization control
     use_layer_norm: bool = True
 
@@ -123,7 +124,7 @@ class QAgentConfig:
 
     # gradient clipping
     critic_grad_clip_norm: float = 1.0
-    actor_grad_clip_norm: float = 1.0
+    actor_grad_clip_norm: float = 0.1 # 1.0
 
     # bc loss regularization
     bc_loss_coef: float = 0.0
@@ -166,7 +167,7 @@ class RLPDAlgoConfig:
     update_every_n_steps: int = 1
 
     # Offline / online mixture ----------------------------------------------
-    offline_fraction: float = 0.5  # 0.5  # fraction of minibatch sampled from offline buffer
+    offline_fraction: float = 0.6  # 0.5  # fraction of minibatch sampled from offline buffer
 
     # ------------------------------------------------------------------
     # N-step returns ----------------------------------------------------
