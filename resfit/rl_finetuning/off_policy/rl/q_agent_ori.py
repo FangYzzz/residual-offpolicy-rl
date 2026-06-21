@@ -10,10 +10,10 @@ from contextlib import contextmanager
 import torch
 from torch import nn
 
-from resfit.rl_finetuning.config.rlpd import QAgentConfig
+from resfit.rl_finetuning.config.rlpd import QAgentConfig, SiglipEncoderConfig
 from resfit.rl_finetuning.off_policy import common_utils
 from resfit.rl_finetuning.off_policy.common_utils import utils
-from resfit.rl_finetuning.off_policy.networks.encoder import VitEncoder
+from resfit.rl_finetuning.off_policy.networks.encoder import VitEncoder, SiglipEncoder
 from resfit.rl_finetuning.off_policy.rl.actor import Actor
 from resfit.rl_finetuning.off_policy.rl.critic import Critic
 
@@ -59,7 +59,7 @@ class QAgent(nn.Module):
 
         # Build the per-camera encoders *after* `self.rl_cameras` is defined so
         # that the helper function can iterate over them.
-        self.encoders: nn.ModuleList = self._build_encoders(obs_shape)
+        self.encoders: nn.ModuleList = self._build_encoders(obs_shape)  # !!!
 
         # All encoders share the same architecture ⇒ repr / patch dim are identical.
         sample_encoder = self.encoders[0]
@@ -69,8 +69,6 @@ class QAgent(nn.Module):
         # Concatenate the patch dimension from every camera (dim=1) → overall
         # representation dimension scales linearly with #cameras.
         repr_dim = repr_dim_single * len(self.rl_cameras)
-        print("encoder output dim: ", repr_dim)
-        print("patch output dim: ", patch_repr_dim)
 
         assert len(prop_shape) == 1
         prop_dim = prop_shape[0] if cfg.use_prop else 0
@@ -151,18 +149,33 @@ class QAgent(nn.Module):
         self.train(True)
         self.to(self.cfg.device)
 
-    def _build_encoders(self, obs_shape):
-        """Constructs and returns an ``nn.ModuleList`` with one encoder per
-        camera based on ``self.cfg.enc_type``.  All encoders share the same
-        architecture and therefore yield feature tensors with identical
-        dimensions which simplifies feature fusion downstream.
-        """
+    # def _build_encoders(self, obs_shape):
+    #     """Constructs and returns an ``nn.ModuleList`` with one encoder per
+    #     camera based on ``self.cfg.enc_type``.  All encoders share the same
+    #     architecture and therefore yield feature tensors with identical
+    #     dimensions which simplifies feature fusion downstream.
+    #     """
 
+    #     encoders = nn.ModuleList()
+
+    #     for _ in self.rl_cameras:
+    #         if self.cfg.enc_type == "vit":
+    #             enc = VitEncoder(obs_shape, self.cfg.vit).to(self.cfg.device)
+    #         else:
+    #             raise AssertionError(f"Unknown encoder type {self.cfg.enc_type}.")
+
+    #         encoders.append(enc)
+
+    #     return encoders
+
+    def _build_encoders(self, obs_shape):  # !!!
         encoders = nn.ModuleList()
 
         for _ in self.rl_cameras:
             if self.cfg.enc_type == "vit":
                 enc = VitEncoder(obs_shape, self.cfg.vit).to(self.cfg.device)
+            elif self.cfg.enc_type == "siglip":
+                enc = SiglipEncoder(obs_shape, self.cfg.siglip).to(self.cfg.device)  # !!!
             else:
                 raise AssertionError(f"Unknown encoder type {self.cfg.enc_type}.")
 
@@ -208,7 +221,7 @@ class QAgent(nn.Module):
 
         self.cfg.act_method = original_method
 
-    def _encode(self, obs: dict[str, torch.Tensor], augment: bool) -> torch.Tensor:
+    def _encode(self, obs: dict[str, torch.Tensor], augment: bool) -> torch.Tensor:  # !!!
         r"""This function encodes the observation into feature tensor.
 
         Images may be stored in the replay buffers as uint8 to save GPU memory.  In
@@ -235,7 +248,7 @@ class QAgent(nn.Module):
             feats.append(feat_cam)
 
         # Concatenate along the *patch* dimension (dim=1)
-        feat_all = torch.cat(feats, dim=1)
+        feat_all = torch.cat(feats, dim=1)  # 多相机融合后的视觉特征 [B, 3N, D]
         return feat_all  # noqa: RET504
 
     def _maybe_unsqueeze_(self, obs):
@@ -257,13 +270,13 @@ class QAgent(nn.Module):
         unsqueezed = self._maybe_unsqueeze_(obs)
 
         assert "feat" not in obs
-        obs["feat"] = self._encode(obs, augment=False)
+        obs["feat"] = self._encode(obs, augment=False)  # !!!
 
         action = self._act_default(
             obs=obs,
             eval_mode=eval_mode,
             stddev=stddev,
-            clip=1,  # clip
+            clip=None,
             use_target=False,
         )
 
@@ -285,7 +298,7 @@ class QAgent(nn.Module):
         use_target: bool,
     ) -> torch.Tensor:
         actor = self.actor_target if use_target else self.actor
-        dist = actor.forward(obs, stddev)
+        dist = actor.forward(obs, stddev)  # action distribution
 
         # Only assert not training when this is called from the public act() method
         # (which is used for actual evaluation), not when called internally during training
@@ -293,9 +306,9 @@ class QAgent(nn.Module):
             assert not self.training
 
         if eval_mode:
-            action = dist.mean
+            action = dist.mean  # 直接用均值动作，不采样噪声
         else:
-            action = dist.sample(clip=clip)
+            action = dist.sample(clip=clip)  # 在均值动作上加噪声 esp
 
         return action
 
@@ -309,27 +322,13 @@ class QAgent(nn.Module):
         stddev: float,
         importance_weights: torch.Tensor | None = None,
     ):
-        # print("=" * 60)
-        # print(f"reward: shape={tuple(reward.shape)}, "
-        #     f"min={reward.min().item():.6f}, "
-        #     f"max={reward.max().item():.6f}, "
-        #     f"mean={reward.mean().item():.6f}, "
-        #     f">0_ratio={(reward > 0).float().mean().item():.4f}, "
-        #     f">0.9_ratio={(reward > 0.9).float().mean().item():.4f}")
-        # print(f"discount: shape={tuple(discount.shape)}, "
-        #     f"min={discount.min().item():.6f}, "
-        #     f"max={discount.max().item():.6f}, "
-        #     f"mean={discount.mean().item():.6f}, "
-        #     f"=0_ratio={(discount == 0).float().mean().item():.4f}")
-        # print(f"clip_q_target_to_reward_range: {self.cfg.clip_q_target_to_reward_range}")
-        # print("=" * 60)
         with torch.no_grad():
             # use train mode as we use actor dropout
             assert self.actor_target.training
 
             # Predict next residual action and form the combined next action
             # Use target_action_noise config to control whether to add noise to target actions
-            next_residual_action = self._act_default(
+            next_residual_action = self._act_default(  # line14: at+1r ∼ πθ′ (st+1, at+1b)
                 obs=next_obs,
                 eval_mode=not self.cfg.target_action_noise,  # Disable noise if target_action_noise=False
                 stddev=stddev,
@@ -340,16 +339,14 @@ class QAgent(nn.Module):
             if self.residual_actor:
                 # Current step: 'action' from the replay buffer is the executed combined action
                 # Next step: combine and clamp to match environment execution
-                next_action = torch.clamp(next_obs["observation.base_action"] + next_residual_action, -1.0, 1.0)
+                next_action = torch.clamp(next_obs["observation.base_action"] + next_residual_action, -1.0, 1.0)  # line15: at+1 = at+1b + at+1r
             else:
                 next_action = next_residual_action
 
             # Compute target Q using min over a random subset of 2 heads
             target_all = self.critic_target.q_value(next_obs["feat"], next_obs["observation.state"], next_action)
-            # print(f"target_all shape: ", target_all.shape)
             target_q_min = target_all.squeeze(-1)  # [B]
-            # print(target_q_min.mean())
-            target_q = (reward + (discount * target_q_min)).detach()
+            target_q = (reward + (discount * target_q_min)).detach()  # line16: y = rt+(1−dt)∗γ∗minsubset(i) Qφ′i (st+1, at+1)
 
         if self.cfg.clip_q_target_to_reward_range:
             target_q = torch.clamp(target_q, min=0, max=1)  # Sparse rewards are in {0, 1}
@@ -390,7 +387,7 @@ class QAgent(nn.Module):
             losses = [self.critic.c51_loss(logits_per_head[i], target_distribution) for i in range(K)]
             critic_loss = torch.stack(losses).mean()
         else:
-            q_all = self.critic(obs["feat"], obs["observation.state"], action).squeeze(-1)  # [K,B]
+            q_all = self.critic(obs["feat"], obs["observation.state"], action).squeeze(-1)  # [K,B] # 算当前 Q（多头）
             # Compute TD errors for prioritized experience replay (before taking mean)
             td_errors = torch.abs(q_all - target_q.unsqueeze(0)).mean(dim=0)  # [B] - mean across heads
 
@@ -418,6 +415,7 @@ class QAgent(nn.Module):
             metrics["train/importance_weights_min"] = importance_weights.min().item()
             metrics["train/importance_weights_max"] = importance_weights.max().item()
 
+        # line17: 反传更新 encoder + critic
         # Zero gradients
         self.encoder_opt.zero_grad(set_to_none=True)
         self.critic_opt.zero_grad(set_to_none=True)
@@ -440,7 +438,7 @@ class QAgent(nn.Module):
     def _compute_actor_loss(self, obs: dict[str, torch.Tensor], stddev: float):
         assert "feat" in obs, "safety check"
 
-        action_pred: torch.Tensor = self._act_default(
+        action_pred: torch.Tensor = self._act_default(  # residual action（actor 输出）
             obs=obs,
             eval_mode=False,
             # stddev=stddev,
@@ -460,7 +458,7 @@ class QAgent(nn.Module):
         else:
             combined_action = action_pred
 
-        q = self.critic.q_value_for_policy(obs["feat"], obs["observation.state"], combined_action)
+        q = self.critic.q_value_for_policy(obs["feat"], obs["observation.state"], combined_action)  # line20: 用 critic 的 policy Q 来评估并最大化，Update θ to maximize
         actor_loss_base = -q.mean()
 
         actor_loss_total = actor_loss_base + action_l2_penalty
@@ -472,7 +470,7 @@ class QAgent(nn.Module):
         obs: dict[str, torch.Tensor] = batch["obs"]
 
         assert "feat" not in obs, "safety check"
-        obs["feat"] = self._encode(obs, augment=True)
+        obs["feat"] = self._encode(obs, augment=True)  # !!!
 
         if not backprop_encoder:
             obs["feat"] = obs["feat"].detach()
@@ -511,13 +509,6 @@ class QAgent(nn.Module):
         # Log L2 regularization penalty if applied
         if self.cfg.actor.action_l2_reg_weight > 0:
             metrics["train/actor_l2_penalty"] = action_l2_penalty.item()
-
-        # Log learnable residual scale statistics if the actor exposes them
-        sigma = getattr(self.actor, "last_sigma", None)
-        if sigma is not None:
-            sigma_det = sigma.detach()
-            metrics["train/scale_sigma_mean"] = sigma_det.mean().item()
-            metrics["train/scale_sigma_max"] = sigma_det.max().item()
 
         self.actor_opt.zero_grad(set_to_none=True)
         actor_loss_total.backward()
@@ -560,13 +551,6 @@ class QAgent(nn.Module):
         # Log L2 regularization penalty if applied
         if self.cfg.actor.action_l2_reg_weight > 0:
             metrics["train/actor_l2_penalty"] = action_l2_penalty.item()
-
-        # Log learnable residual scale statistics if the actor exposes them
-        sigma = getattr(self.actor, "last_sigma", None)
-        if sigma is not None:
-            sigma_det = sigma.detach()
-            metrics["train/scale_sigma_mean"] = sigma_det.mean().item()
-            metrics["train/scale_sigma_max"] = sigma_det.max().item()
 
         # Use config option to control whether BC loss updates encoder
         bc_backprop_encoder = self.cfg.bc_backprop_encoder
@@ -640,20 +624,20 @@ class QAgent(nn.Module):
         next_nonterminal: torch.Tensor = batch["nonterminal"]
         next_obs: dict[str, torch.Tensor] = batch[("next", "obs")]
 
-        # To not b ootstrap on terminal states we zero out the discount factor for terminal next states
+        # To not bootstrap on terminal states we zero out the discount factor for terminal next states
         effective_discount = discount * next_nonterminal
 
-        obs["feat"] = self._encode(obs, augment=True)
+        obs["feat"] = self._encode(obs, augment=True)  # !!!  多相机融合后的视觉特征
 
         with torch.no_grad():
-            next_obs["feat"] = self._encode(next_obs, augment=True)
+            next_obs["feat"] = self._encode(next_obs, augment=True)  # !!!
 
         metrics = {}
         metrics["data/batch_R"] = reward.mean().item()
 
         # Extract importance sampling weights if available (for prioritized experience replay)
         importance_weights = batch.get("_weight", None)
-        # print(f"reward: {reward}")
+
         critic_metric = self.update_critic(
             obs=obs,
             action=action,
@@ -663,7 +647,7 @@ class QAgent(nn.Module):
             stddev=stddev,
             importance_weights=importance_weights,
         )
-        utils.soft_update_params(self.critic, self.critic_target, self.cfg.critic_target_tau)
+        utils.soft_update_params(self.critic, self.critic_target, self.cfg.critic_target_tau)  # line18: Update critic targets φi′ ← ρφi′ + (1 − ρ)φi
         metrics.update(critic_metric)
 
         if not update_actor:
@@ -678,7 +662,7 @@ class QAgent(nn.Module):
             assert ref_agent is not None
             actor_metric = self.update_actor_rft(obs, stddev, bc_batch, ref_agent)
 
-        utils.soft_update_params(self.actor, self.actor_target, self.cfg.critic_target_tau)
+        utils.soft_update_params(self.actor, self.actor_target, self.cfg.critic_target_tau)  # line21: Update actor target θ′ ← ρθ′ + (1 − ρ)θ
         metrics.update(actor_metric)
 
         return metrics

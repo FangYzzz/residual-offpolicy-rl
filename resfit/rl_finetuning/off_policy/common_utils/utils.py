@@ -174,6 +174,8 @@ class TruncatedNormal(pyd.Normal):
         eps *= self.scale
         if clip is not None:
             eps = torch.clamp(eps, -clip, clip)
+        # print("eps:", eps)
+        # print("self.loc:", self.loc)
         x = self.loc + eps  # action = scaled_mu(in actor.py) + N(0, self.scale^2)
         x = self._clamp(x)
         if self.max_action_norm > 0:

@@ -80,11 +80,16 @@ class TaskRewardGenerator:
         self.img_rgb = None
 
         self.candidate_tasks = [
-            "pick up the cube and place it into the bowl"
-            # "pick up the cube from the bowl and place it in front of the bowl"
-            # "pick up the cube from the bowl and place it behind the bowl"
-            # "pick up the cube from the bowl and place it to the left of the bowl"
-            # "pick up the cube from the bowl and place it to the right of the bowl"
+            ### task1 ###
+            # cube_in50_out50
+            # "pick up the cube and place it into the bowl",
+            # "pick up the cube from the bowl and place it outside the bowl",
+            # cube_fix_in80_out50
+            "put the cube into the bowl",
+            "put the cube outside the bowl",
+            ### task2 ###
+            # "open the drawer"
+            # "close the drawer"
         ]
 
     def setup_logger(self):
@@ -95,6 +100,173 @@ class TaskRewardGenerator:
         logger.add(log_path, format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}", level="INFO")
         logger.add(sys.stdout, colorize=True, format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | {message}")
         # logger.add(lambda msg: print(msg, end=""), format="{message}")
+
+    def reduce_exposure_bgr(self, img_bgr, alpha=0.65, beta=-20):
+        """
+        只用于 GPT / DINO 的图像预处理。
+        new_pixel = alpha * old_pixel + beta
+        alpha < 1: 降低整体亮度/对比度，亮的地方不那么亮
+        beta < 0: 整体压暗
+        """
+        return cv2.convertScaleAbs(img_bgr, alpha=alpha, beta=beta)
+    
+    # def enhance_bowl_visibility_bgr(self, img_bgr):
+    #     """
+    #     更推荐版本：
+    #     只在低饱和、高亮区域附近增强，避免增强整张地面。
+    #     """
+
+    #     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    #     h, s, v = cv2.split(hsv)
+
+    #     # 初步找白色/灰白色物体区域
+    #     candidate_mask = ((v > 130) & (s < 80)).astype(np.uint8) * 255
+
+    #     kernel = np.ones((7, 7), np.uint8)
+
+    #     # 去噪
+    #     candidate_mask = cv2.morphologyEx(candidate_mask, cv2.MORPH_OPEN, kernel)
+
+    #     # 扩大一点，让 bowl 边缘也被处理到
+    #     candidate_mask = cv2.dilate(candidate_mask, kernel, iterations=2)
+
+    #     # 平滑 mask
+    #     candidate_mask = cv2.GaussianBlur(candidate_mask, (31, 31), 0)
+
+    #     mask_f = candidate_mask.astype(np.float32) / 255.0
+    #     mask_f = mask_f[..., None]
+
+    #     # 对整图生成一个增强版本
+    #     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+    #     l, a, b = cv2.split(lab)
+
+    #     clahe = cv2.createCLAHE(
+    #         clipLimit=1.5,
+    #         tileGridSize=(8, 8)
+    #     )
+    #     l_clahe = clahe.apply(l)
+
+    #     lab_clahe = cv2.merge([l_clahe, a, b])
+    #     img_enhanced = cv2.cvtColor(lab_clahe, cv2.COLOR_LAB2BGR)
+
+    #     # 再轻微压暗增强图中的高亮
+    #     hsv_enhanced = cv2.cvtColor(img_enhanced, cv2.COLOR_BGR2HSV)
+    #     h2, s2, v2 = cv2.split(hsv_enhanced)
+
+    #     v2 = np.where((v2 > 180) & (s2 < 100), v2 * 0.8, v2)
+    #     v2 = np.clip(v2, 0, 255).astype(np.uint8)
+
+    #     hsv_enhanced = cv2.merge([h2, s2, v2])
+    #     img_enhanced = cv2.cvtColor(hsv_enhanced, cv2.COLOR_HSV2BGR)
+
+    #     # 只在候选 bowl 区域融合增强图
+    #     out = img_bgr.astype(np.float32) * (1.0 - mask_f) + img_enhanced.astype(np.float32) * mask_f
+
+    #     return np.clip(out, 0, 255).astype(np.uint8)
+    
+    # def enhance_cube_visibility_bgr(self, img_bgr):
+    #     """
+    #     专门增强 cube 的颜色和边缘：
+    #     1. 找到有颜色的区域，例如绿色/橙色 cube
+    #     2. 只增强这些区域的饱和度
+    #     3. 对这些区域做轻微锐化，让边缘更清晰
+    #     """
+
+    #     img_float = img_bgr.astype(np.float32)
+
+    #     # BGR -> HSV，方便增强颜色
+    #     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
+    #     h, s, v = cv2.split(hsv)
+
+    #     # 找有颜色的区域
+    #     # cube 是绿色/橙色，饱和度会比 bowl 和地面高
+    #     color_mask = ((s > 35) & (v > 60)).astype(np.uint8) * 255
+
+    #     # 去掉小噪点
+    #     kernel = np.ones((3, 3), np.uint8)
+    #     color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, kernel)
+
+    #     # 扩大一点，覆盖 cube 边缘
+    #     color_mask = cv2.dilate(color_mask, kernel, iterations=1)
+
+    #     # 平滑 mask，避免边缘突兀
+    #     color_mask = cv2.GaussianBlur(color_mask, (9, 9), 0)
+
+    #     mask_f = color_mask.astype(np.float32) / 255.0
+    #     mask_f = mask_f[..., None]
+
+    #     # 增强饱和度和亮度
+    #     s_enhanced = np.clip(s * 2.0, 0, 255)
+    #     v_enhanced = np.clip(v * 1.08, 0, 255)
+
+    #     hsv_enhanced = cv2.merge([h, s_enhanced, v_enhanced]).astype(np.uint8)
+    #     img_color_enhanced = cv2.cvtColor(hsv_enhanced, cv2.COLOR_HSV2BGR)
+
+    #     # 轻微锐化，增强 cube 边界
+    #     blur = cv2.GaussianBlur(img_color_enhanced, (0, 0), 1.0)
+    #     img_sharp = cv2.addWeighted(img_color_enhanced, 1.6, blur, -0.6, 0)
+
+    #     # 只在彩色区域融合增强结果
+    #     out = img_float * (1.0 - mask_f) + img_sharp.astype(np.float32) * mask_f
+
+    #     return np.clip(out, 0, 255).astype(np.uint8)
+
+    def enhance_cube_visibility_bgr(self, img_bgr):
+        """
+        专门增强 cube 的颜色和边缘：
+        1. 找到有颜色的区域，例如绿色/橙色/淡黄色 cube
+        2. 只增强这些区域的饱和度
+        3. 对这些区域做轻微锐化，让边缘更清晰
+        """
+
+        hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
+        h, s, v = cv2.split(hsv)
+
+        # 绿色区域
+        green_mask = (
+            (h >= 35) & (h <= 90) &
+            (s >= 20) &
+            (v >= 50)
+        )
+
+        # 橙色 / 黄色 / 原木色区域
+        yellow_orange_wood_mask = (
+            (h >= 8) & (h <= 40) &
+            (s >= 15) &
+            (v >= 50)
+        )
+
+        # 合并 cube 可能的颜色区域
+        cube_mask = (green_mask | yellow_orange_wood_mask).astype(np.uint8) * 255
+
+        # 去掉小噪点
+        kernel = np.ones((3, 3), np.uint8)
+        cube_mask = cv2.morphologyEx(cube_mask, cv2.MORPH_OPEN, kernel)
+
+        # 稍微扩张，覆盖 cube 边缘
+        cube_mask = cv2.dilate(cube_mask, kernel, iterations=1)
+
+        # 平滑边界，避免处理痕迹明显
+        cube_mask = cv2.GaussianBlur(cube_mask, (9, 9), 0)
+
+        mask_f = cube_mask.astype(np.float32) / 255.0
+        mask_f = mask_f[..., None]
+
+        # 增强 cube 的饱和度和亮度
+        s_enhanced = np.clip(s * 2.3, 0, 255)
+        v_enhanced = np.clip(v * 1.08, 0, 255)
+
+        hsv_enhanced = cv2.merge([h, s_enhanced, v_enhanced]).astype(np.uint8)
+        img_color_enhanced = cv2.cvtColor(hsv_enhanced, cv2.COLOR_HSV2BGR)
+
+        # 锐化边缘
+        blur = cv2.GaussianBlur(img_color_enhanced, (0, 0), 1.0)
+        img_sharp = cv2.addWeighted(img_color_enhanced, 1.7, blur, -0.7, 0)
+
+        # 只在 cube 颜色区域融合增强结果
+        out = img_bgr.astype(np.float32) * (1.0 - mask_f) + img_sharp.astype(np.float32) * mask_f
+
+        return np.clip(out, 0, 255).astype(np.uint8)
 
     def mask_image(self, image):
         """
@@ -145,23 +317,58 @@ class TaskRewardGenerator:
 
         return masked_image
 
+    # def process_img(self, img_rgb):
+    #     img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+
+    #     # save_dir = f"output/task_reward_generation/{self.timestamp}"
+    #     # os.makedirs(save_dir, exist_ok=True)
+    #     # save_path = os.path.join(save_dir, f"scene_{round}.jpg")
+    #     # # cv2.imwrite(save_path, img_bgr)
+    #     # cv2.imwrite(save_path, img_rgb)
+
+    #     ok, buffer = cv2.imencode(".jpg", img_bgr)
+    #     if ok:
+    #         b64jpg = base64.b64encode(buffer.tobytes()).decode("utf-8")
+    #     else:
+    #         raise RuntimeError("Failed to encode image to JPEG")
+        
+    #     # masked_img_rgb = self.mask_image(img_rgb)
+    #     masked_img_bgr = self.mask_image(img_bgr)
+
+    #     # return masked_img_rgb, b64jpg
+    #     return masked_img_bgr, b64jpg
+    
     def process_img(self, img_rgb):
         img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+        # ok, buffer = cv2.imencode(".jpg", img_bgr)
+
+        img_bgr_low_exp = self.reduce_exposure_bgr(
+            img_bgr,
+            alpha=0.55,  # 0.6 # 0.8
+            beta=0,      # 0   # -30
+        )
+        ok, buffer = cv2.imencode(".jpg", img_bgr_low_exp)
+        
+        # # 1. 先增强 bowl，改善白色碗的结构
+        # img_bgr_processed = self.enhance_bowl_visibility_bgr(img_bgr)
+        # 2. 再增强 cube，提升颜色和边缘
+        img_bgr_processed = self.enhance_cube_visibility_bgr(img_bgr_low_exp)  # img_bgr_processed
+        ok, buffer = cv2.imencode(".jpg", img_bgr_processed)
 
         # save_dir = f"output/task_reward_generation/{self.timestamp}"
         # os.makedirs(save_dir, exist_ok=True)
         # save_path = os.path.join(save_dir, f"scene_{round}.jpg")
         # # cv2.imwrite(save_path, img_bgr)
         # cv2.imwrite(save_path, img_rgb)
-
-        ok, buffer = cv2.imencode(".jpg", img_bgr)
+        
         if ok:
             b64jpg = base64.b64encode(buffer.tobytes()).decode("utf-8")
         else:
             raise RuntimeError("Failed to encode image to JPEG")
         
         # masked_img_rgb = self.mask_image(img_rgb)
-        masked_img_bgr = self.mask_image(img_bgr)
+        # masked_img_bgr = self.mask_image(img_bgr_low_exp)
+        masked_img_bgr = self.mask_image(img_bgr_processed)
 
         # return masked_img_rgb, b64jpg
         return masked_img_bgr, b64jpg
@@ -170,11 +377,34 @@ class TaskRewardGenerator:
         with open(image_path, "rb") as image_file:
             return base64.b64encode(image_file.read()).decode("utf-8")
 
+    def filter_gdino_boxes(self, boxes, logits, phrases, max_area_ratio=0.25):
+        """
+        去掉占图像面积太大的框，例如整张桌子的红色大框。
+        boxes: GroundingDINO 输出，cxcywh，归一化坐标
+        """
+        keep = []
+
+        for i, box in enumerate(boxes):
+            cx, cy, w, h = box.tolist()
+            area_ratio = w * h
+
+            if area_ratio < max_area_ratio:
+                keep.append(i)
+
+        if len(keep) == 0:
+            return boxes, logits, phrases
+
+        boxes = boxes[keep]
+        logits = logits[keep]
+        phrases = [phrases[i] for i in keep]
+
+        return boxes, logits, phrases
+
     def gdino(self, scene, before):
         # IMAGE_PATH = image_path # "weights/dog-3.jpeg"
         TEXT_PROMPT = self.selected_objects # "chair . person . dog ."
-        BOX_TRESHOLD = 0.32 # 0.35
-        TEXT_TRESHOLD = 0.25 # 0.25
+        BOX_THRESHOLD = 0.33 # 0.30 # 0.35
+        TEXT_THRESHOLD = 0.22 # 0.22 # 0.25
 
         image_source, image = load_image(scene)  # IMAGE_PATH
 
@@ -182,8 +412,13 @@ class TaskRewardGenerator:
             model=self.model,
             image=image,
             caption=TEXT_PROMPT,
-            box_threshold=BOX_TRESHOLD,
-            text_threshold=TEXT_TRESHOLD
+            box_threshold=BOX_THRESHOLD,
+            text_threshold=TEXT_THRESHOLD
+        )
+
+        boxes, logits, phrases = self.filter_gdino_boxes(
+            boxes, logits, phrases,
+            max_area_ratio=0.25,
         )
 
         annotated_frame = annotate(image_source=image_source, boxes=boxes, logits=logits, phrases=phrases)
@@ -200,17 +435,32 @@ class TaskRewardGenerator:
 
         return scene_gdino
 
-    def task_generator(self, scene, candidate_tasks):
-        tasks_text = "\n".join([f"- {task}" for task in candidate_tasks])
+    def task_generator(self, scene):
+        tasks_text = "\n".join([f"- {task}" for task in self.candidate_tasks])
+
+        # prompt_task = (
+        #     "You are a one-arm robot. Based on the image, judge the spatial relationships between objects.\n"
+        #     "From the task list below, randomly choose ONE feasible task for the current scene.\n"
+        #     "Do not invent or modify tasks.\n\n"
+        #     f"Task list:\n{tasks_text}\n\n"
+        #     "Return exactly in this format:\n"
+        #     "task: <selected task>\n"
+        #     # "objects: object1 . object2 .\n"
+        #     "objects: \"object1 . object2 .\"\n"
+        # )
 
         prompt_task = (
-            "You are a one-arm robot. Based on the image, judge the spatial relationships between objects.\n"
-            "From the task list below, randomly choose ONE feasible task for the current scene.\n"
-            "Do not invent or modify tasks.\n\n"
             f"Task list:\n{tasks_text}\n\n"
+            "You are a one-arm robot. Based on the image, judge the spatial relationships between objects.\n"
+            "From the task list below, randomly choose ONE task that is feasible AND not already completed in the current scene.\n"
+            "A task is already completed if its desired final spatial relationship is already true in the image.\n"
+            "For example, if the cube is already inside the bowl, do NOT choose 'put the cube into the bowl'.\n"
+            "Only choose a task whose goal state is currently false but can be achieved by the robot.\n"
+            "Do not invent, rewrite, or modify tasks.\n\n"
+            
             "Return exactly in this format:\n"
             "task: <selected task>\n"
-            "objects: object1 . object2 .\n"
+            "objects: <object1> . <object2> .\n"
         )
 
         response = self.client.responses.create(
@@ -306,7 +556,7 @@ class TaskRewardGenerator:
         #     self.task_generator(scene_gpt, self.candidate_tasks)
 
         scene_dino, scene_gpt = self.process_img(img_rgb)
-        self.task_generator(scene_gpt, self.candidate_tasks)
+        self.task_generator(scene_gpt)
         
         self.round += 1
         self.scene_before = self.gdino(scene_dino, before=True)
@@ -316,11 +566,14 @@ class TaskRewardGenerator:
         
         return self.selected_task, self.round
     
-    def reward_generation(self, img_rgb):
+    def reward_generation(self, img_rgb, task_prompt = None):
         next_scene_dino, next_scene_gpt = self.process_img(img_rgb)
         self.scene_after = self.gdino(next_scene_dino, before=False)
-
-        reward = self.reward_generator(self.scene_before, self.scene_after, self.selected_task)
+        if task_prompt ==None:
+            task = self.selected_task
+        else:
+            task = task_prompt
+        reward = self.reward_generator(self.scene_before, self.scene_after, task)
         logger.info(f"Reward: {reward}")
         
         # self.round += 1

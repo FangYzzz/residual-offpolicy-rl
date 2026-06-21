@@ -16,9 +16,13 @@ from resfit.rl_finetuning.off_policy.common_utils import utils
 from resfit.rl_finetuning.off_policy.networks.encoder import VitEncoder
 from resfit.rl_finetuning.off_policy.rl.actor import Actor
 from resfit.rl_finetuning.off_policy.rl.critic import Critic
+from resfit.rl_finetuning.off_policy.rl.lang_encoder import LanguageEncoder
 
 
-class QAgent(nn.Module):
+
+
+
+class QAgentLang(nn.Module):
     def __init__(
         self,
         obs_shape: tuple[int, int, int],
@@ -28,27 +32,31 @@ class QAgent(nn.Module):
         cfg: QAgentConfig,
         residual_actor: bool = False,
     ):
-        """Initialize the Q-agent.
+        """Initialize the language-conditioned Q-agent.
+
+        The proprioceptive vector seen by the actor / critic is
+        ``concat(observation.state, lang_proj(observation.task_emb))`` so the
+        underlying networks are unchanged structurally — they just see a
+        slightly larger ``prop_dim``.
 
         Parameters
         ----------
         obs_shape : tuple[int, int, int]
-            Shape (C, H, W) for **a single camera** image.  When multiple
-            cameras are used the same shape is assumed for every view.
+            Shape (C, H, W) for **a single camera** image.
         prop_shape : tuple[int]
-            Shape of the proprioceptive (low-dimensional) observation vector.
+            Shape of the *raw* proprioceptive vector (before task embedding
+            is appended).
         action_dim : int
             Number of action dimensions.
         rl_cameras : list[str] | str
             Name(s) of the camera images to be used by the RL policy.
-            These are keys into the env's observation. A single string
-            is accepted for backwards-compatibility but the preferred interface
-            is to pass a list of camera names.
         cfg : QAgentConfig
-            Hyper-parameter configuration dataclass.
+            Hyper-parameter configuration dataclass; must include
+            ``cfg.language``.
+        residual_actor : bool
+            Whether the actor outputs a residual on top of a base action.
         """
         super().__init__()
-        # Normalise *rl_cameras* to a list for unified processing
         if isinstance(rl_cameras, str):
             rl_cameras = [rl_cameras]
         assert len(rl_cameras) > 0, "At least one camera must be provided"
@@ -57,25 +65,38 @@ class QAgent(nn.Module):
         self.cfg = cfg
         self.residual_actor = residual_actor
 
-        # Build the per-camera encoders *after* `self.rl_cameras` is defined so
-        # that the helper function can iterate over them.
+        self.lang_cfg = cfg.language
+        self.lang_enabled: bool = bool(self.lang_cfg.enabled)
+        self._raw_prop_dim: int = int(prop_shape[0])
+
         self.encoders: nn.ModuleList = self._build_encoders(obs_shape)
 
-        # All encoders share the same architecture ⇒ repr / patch dim are identical.
         sample_encoder = self.encoders[0]
         repr_dim_single = int(sample_encoder.repr_dim)  # type: ignore[attr-defined]
         patch_repr_dim = int(sample_encoder.patch_repr_dim)  # type: ignore[attr-defined]
 
-        # Concatenate the patch dimension from every camera (dim=1) → overall
-        # representation dimension scales linearly with #cameras.
         repr_dim = repr_dim_single * len(self.rl_cameras)
         print("encoder output dim: ", repr_dim)
         print("patch output dim: ", patch_repr_dim)
 
         assert len(prop_shape) == 1
-        prop_dim = prop_shape[0] if cfg.use_prop else 0
+        raw_prop_dim = prop_shape[0] if cfg.use_prop else 0
 
-        # create critics & actor
+        if self.lang_enabled:
+            self.lang_encoder = LanguageEncoder(
+                lang_emb_dim=self.lang_cfg.lang_emb_dim,
+                lang_proj_dim=self.lang_cfg.lang_proj_dim,
+                hidden_dim=self.lang_cfg.hidden_dim,
+                num_layers=self.lang_cfg.num_layers,
+                use_layer_norm=self.lang_cfg.use_layer_norm,
+                dropout=self.lang_cfg.dropout,
+            )
+            prop_dim = raw_prop_dim + self.lang_cfg.lang_proj_dim
+        else:
+            self.lang_encoder = None
+            prop_dim = raw_prop_dim
+        self._effective_prop_dim: int = int(prop_dim)
+
         self.critic = Critic(
             repr_dim=repr_dim,
             patch_repr_dim=patch_repr_dim,
@@ -107,9 +128,16 @@ class QAgent(nn.Module):
                 param.requires_grad = False
             print("🧊 Encoder parameters frozen - no gradient updates will be performed")
 
-        # Create optimizers (PyTorch will ignore frozen parameters)
+        # Create optimizers (PyTorch will ignore frozen parameters).
+        # The language encoder is trained jointly with the critic, so its
+        # parameters live in ``critic_opt``; during the actor update we detach
+        # the projected task feature so its gradient does not flow into the
+        # language encoder there.
         self.encoder_opt = torch.optim.AdamW(self.encoders.parameters(), lr=self.cfg.critic_lr)
-        self.critic_opt = torch.optim.AdamW(self.critic.parameters(), lr=self.cfg.critic_lr)
+        critic_params = list(self.critic.parameters())
+        if self.lang_enabled:
+            critic_params += list(self.lang_encoder.parameters())
+        self.critic_opt = torch.optim.AdamW(critic_params, lr=self.cfg.critic_lr)
         self.actor_opt = torch.optim.AdamW(self.actor.parameters(), lr=self.cfg.actor_lr)
 
         # LR schedulers for warmup (if warmup is enabled)
@@ -151,6 +179,57 @@ class QAgent(nn.Module):
         self.train(True)
         self.to(self.cfg.device)
 
+    # ------------------------------------------------------------------ #
+    # Language fusion helpers                                            #
+    # ------------------------------------------------------------------ #
+    def _augment_state(
+        self, obs: dict[str, torch.Tensor], *, detach_lang: bool = False
+    ) -> dict[str, torch.Tensor]:
+        """Return a *shallow copy* of ``obs`` whose ``observation.state`` has
+        been concatenated with the projected task embedding.
+
+        Idempotent: if ``observation.state`` already has the augmented size,
+        the obs is returned unchanged.
+        """
+        if not self.lang_enabled:
+            return obs
+
+        state = obs["observation.state"]
+        # Idempotent guard so the caller can safely double-augment.
+        if state.size(-1) == self._effective_prop_dim:
+            return obs
+        assert state.size(-1) == self._raw_prop_dim, (
+            f"Unexpected observation.state size {state.size(-1)}, "
+            f"expected raw {self._raw_prop_dim} or augmented {self._effective_prop_dim}"
+        )
+
+        key = self.lang_cfg.lang_emb_obs_key
+        assert key in obs, (
+            f"Language fusion enabled but obs is missing '{key}'. "
+            f"Make sure the env wrapper / replay buffer populates it."
+        )
+
+        x = obs[key]
+        feat = self.lang_encoder(x)  # [B, lang_proj_dim]
+        if detach_lang:
+            feat = feat.detach()
+
+        # Broadcast batch dims
+        if state.dim() == 2 and feat.dim() == 2:
+            if feat.size(0) == 1 and state.size(0) > 1:
+                feat = feat.expand(state.size(0), -1)
+        elif state.dim() == 1 and feat.dim() == 2 and feat.size(0) == 1:
+            feat = feat.squeeze(0)
+        elif state.dim() == 2 and feat.dim() == 1:
+            feat = feat.unsqueeze(0).expand(state.size(0), -1)
+
+        new_state = torch.cat([state, feat], dim=-1)
+
+        new_obs = copy.copy(obs)
+        new_obs["observation.state"] = new_state
+        return new_obs
+
+    # ------------------------------------------------------------------ #
     def _build_encoders(self, obs_shape):
         """Constructs and returns an ``nn.ModuleList`` with one encoder per
         camera based on ``self.cfg.enc_type``.  All encoders share the same
@@ -182,6 +261,8 @@ class QAgent(nn.Module):
         self.encoders.train(training)
         self.actor.train(training)
         self.critic.train(training)
+        if self.lang_encoder is not None:
+            self.lang_encoder.train(training)
 
         assert not self.critic_target.training
         for bc_policy in self.bc_policies:
@@ -255,6 +336,10 @@ class QAgent(nn.Module):
         # Make a shallow copy of the observation dict
         obs = copy.copy(obs)
         unsqueezed = self._maybe_unsqueeze_(obs)
+
+        # Inject the projected task feature into observation.state.
+        # detach_lang=True since we never train the lang encoder via act().
+        obs = self._augment_state(obs, detach_lang=True)
 
         assert "feat" not in obs
         obs["feat"] = self._encode(obs, augment=False)
@@ -471,6 +556,23 @@ class QAgent(nn.Module):
         assert not self.residual_actor, "Not implemented"
         obs: dict[str, torch.Tensor] = batch["obs"]
 
+        # Inject the projected (detached) task feature into observation.state
+        # *in place* on batch["obs"], because the bc_loss_dynamic path in
+        # update_actor_rft reads bc_batch.obs["observation.state"] and
+        # bc_batch.obs["feat"] directly afterwards and expects them to match
+        # the augmented prop_dim seen by the critic.
+        if self.lang_enabled and obs["observation.state"].size(-1) == self._raw_prop_dim:
+            key = self.lang_cfg.lang_emb_obs_key
+            assert key in obs, (
+                f"Language fusion enabled but bc obs is missing '{key}'."
+            )
+            with torch.no_grad():
+                feat = self.lang_encoder(obs[key])
+            state = obs["observation.state"]
+            if state.dim() == 2 and feat.dim() == 2 and feat.size(0) == 1 and state.size(0) > 1:
+                feat = feat.expand(state.size(0), -1)
+            obs["observation.state"] = torch.cat([state, feat], dim=-1)
+
         assert "feat" not in obs, "safety check"
         obs["feat"] = self._encode(obs, augment=True)
 
@@ -631,7 +733,7 @@ class QAgent(nn.Module):
         stddev,
         update_actor,
         bc_batch=None,
-        ref_agent: QAgent | None = None,
+        ref_agent: "QAgentLang | None" = None,
     ):
         obs: dict[str, torch.Tensor] = batch["obs"]
         action: torch.Tensor = batch["action"]
@@ -640,8 +742,17 @@ class QAgent(nn.Module):
         next_nonterminal: torch.Tensor = batch["nonterminal"]
         next_obs: dict[str, torch.Tensor] = batch[("next", "obs")]
 
-        # To not b ootstrap on terminal states we zero out the discount factor for terminal next states
+        # To not bootstrap on terminal states we zero out the discount factor for terminal next states
         effective_discount = discount * next_nonterminal
+
+        # ------------------------------------------------------------------
+        # Critic phase: gradients flow through the language encoder so it
+        # gets trained by the TD objective.
+        # ------------------------------------------------------------------
+        obs = self._augment_state(obs, detach_lang=False)
+        # next_obs is only used inside no_grad for target computation, so the
+        # grad-flow flag has no effect there.
+        next_obs = self._augment_state(next_obs, detach_lang=False)
 
         obs["feat"] = self._encode(obs, augment=True)
 
@@ -669,14 +780,25 @@ class QAgent(nn.Module):
         if not update_actor:
             return metrics
 
-        # NOTE: actor loss does not backprop into the encoder
-        obs["feat"] = obs["feat"].detach()
+        # NOTE: actor loss does not backprop into the image encoder, and we
+        # also block gradients into the language encoder here (it has already
+        # been trained via the critic objective above).
+        if self.lang_enabled:
+            # Re-augment the *original* (unaugmented) obs with a detached lang
+            # feature.  We pull the un-augmented state from batch["obs"] which
+            # has not been modified in place because _augment_state returned a
+            # shallow copy.
+            actor_obs = self._augment_state(batch["obs"], detach_lang=True)
+            actor_obs["feat"] = obs["feat"].detach()
+        else:
+            actor_obs = obs
+            actor_obs["feat"] = actor_obs["feat"].detach()
 
         if bc_batch is None:
-            actor_metric = self.update_actor(obs, stddev)
+            actor_metric = self.update_actor(actor_obs, stddev)
         else:
             assert ref_agent is not None
-            actor_metric = self.update_actor_rft(obs, stddev, bc_batch, ref_agent)
+            actor_metric = self.update_actor_rft(actor_obs, stddev, bc_batch, ref_agent)
 
         utils.soft_update_params(self.actor, self.actor_target, self.cfg.critic_target_tau)
         metrics.update(actor_metric)

@@ -71,6 +71,26 @@ class CriticConfig:
             f"Invalid policy_gradient_type: {self.policy_gradient_type}"
         )
 
+@dataclass
+class LanguageConfig:
+    enabled: bool = True
+
+    lang_emb_obs_key: str = "observation.task_emb"
+
+    lang_emb_dim: int = 384
+    lang_proj_dim: int = 64
+
+    hidden_dim: int = 256
+    num_layers: int = 2
+    use_layer_norm: bool = True
+    dropout: float = 0.0
+
+    fusion: str = "prop"
+
+    def __post_init__(self):
+        assert self.fusion in ("prop",), (
+            f"Only 'prop' fusion is implemented in this variant, got {self.fusion!r}"
+        )
 
 @dataclass
 class ActorConfig:
@@ -102,6 +122,10 @@ class ActorConfig:
     # Layer normalization control
     use_layer_norm: bool = True
 
+    scale_head_max: float = 1.0 * 0.1
+    scale_head_init_value: float = 0.01
+    scale_head_per_dim: bool = True
+    scale_head_enabled: bool = True  ### True
 
 @dataclass
 class QAgentConfig:
@@ -121,7 +145,7 @@ class QAgentConfig:
     # critic & actor
     critic: CriticConfig = field(default_factory=lambda: CriticConfig())
     actor: ActorConfig = field(default_factory=lambda: ActorConfig())
-
+    language: LanguageConfig | None = field(default_factory=LanguageConfig)
     # gradient clipping
     critic_grad_clip_norm: float = 1.0
     actor_grad_clip_norm: float = 0.1 # 1.0
@@ -162,8 +186,8 @@ class RLPDAlgoConfig:
     gamma: float = 0.99
 
     # Update scheduling ------------------------------------------------------
-    num_updates_per_iteration: int = 16 #4
-    actor_updates_per_iteration: int =4 #1
+    num_updates_per_iteration: int = 16  # 4
+    actor_updates_per_iteration: int = 4  # 1
     update_every_n_steps: int = 1
 
     # Offline / online mixture ----------------------------------------------
@@ -280,7 +304,7 @@ class RLPDDexmgConfig:
     task: str = "Can"
     num_envs: int = 1
     eval_num_envs: int = 8
-    eval_num_episodes: int = 10  # 50
+    eval_num_episodes: int = 20  # 50
     headless: bool = True
     video_key: str = "observation.images.agentview"
     rl_camera: List[str] = field(

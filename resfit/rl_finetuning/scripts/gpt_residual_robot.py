@@ -20,6 +20,7 @@ from droid.franka_env import RobotEnv
 json_numpy.patch()
 from scipy.spatial.transform import Rotation as R
 import time
+from loguru import logger
 
 from utils import process_policy_images, _extract_observation, prepare_image_256, to_hwc
 from task_reward_generator import TaskRewardGenerator
@@ -45,7 +46,7 @@ def prevent_keyboard_interrupt():
             raise KeyboardInterrupt
 
 class Args:
-    max_timesteps: int = 140 # 160 # 200 # 180   
+    max_timesteps: int = 140 # 150 # 200 # 180   
 
     # GPT server(task_reward_generation_zedx.py)
     gpt_host: str = "127.0.0.1"  # 机器 IP
@@ -71,7 +72,8 @@ class BasePolicy:
         self.args = args
         self.pi05_client = websocket_client_policy.WebsocketClientPolicy(args.pi05_host, args.pi05_port)
         # self.text = "pick up the tomato and place it into the bowl"
-        self.text = "pick up the cube and place it into the bowl"
+        # self.text = "pick up the cube and place it into the bowl"
+        self.text = "put the cube into the bowl"
         self.max_timesteps = args.max_timesteps
         self.t_step = 0
         self.round = 0
@@ -79,8 +81,9 @@ class BasePolicy:
         self.obs = None
         self.last_excution_time  = time.time()
         self.eefpose = None
-        
+        self.gripper_position = None
         self.task_reward_generator = TaskRewardGenerator()
+        self.evaluation = False
 
     def to(self, device: str | torch.device):
         self.device = torch.device(device)
@@ -109,6 +112,8 @@ class BasePolicy:
             self.env.get_observation(),
             save_to_disk=False,
         )
+        self.gripper_position = self.obs["gripper_position"]
+    
     def save_debug_images(self, obs_left, obs_right, obs_wrist, save_dir="debug_images"):
         os.makedirs(save_dir, exist_ok=True)
 
@@ -130,7 +135,7 @@ class BasePolicy:
                 img_to_save = img
             cv2.imwrite(path, img_to_save)
 
-    def get_obs_for_base(self):
+    def get_obs_for_base(self, task_prompt):
         obs_left = copy.deepcopy(self.obs["left_image"])
         obs_right = copy.deepcopy(self.obs["right_image"])
         obs_wrist = copy.deepcopy(self.obs["wrist_image"])
@@ -157,7 +162,7 @@ class BasePolicy:
             "observation/exterior_image_2_left": image_tools.resize_with_pad(obs_wrist, 224, 224),
             "observation/eef_position": eef_pose_quat,
             "observation/gripper_position": gripper_position,
-            "prompt": self.text,  # instruction
+            "prompt": task_prompt,  # instruction
         }
     
     def get_obs_for_residual(self, base_naction):
@@ -206,7 +211,7 @@ class BasePolicy:
 
         return augemnted_obs
 
-    def reset(self):
+    def reset(self, task_prompt = None):
         self.t_step = 0
         self.env.reset()  # 1.593s
 
@@ -215,16 +220,21 @@ class BasePolicy:
         
         if self.round != 0:
             self.update_obs()
-            self.reward =  float(self.task_reward_generator.reward_generation(self.obs["right_image"]))  # 0 or 1
-            print("reward:", self.reward)
+            self.reward =  float(self.task_reward_generator.reward_generation(self.obs["right_image"], task_prompt))  # 0 or 1
+            # print("reward:", self.reward)
+            # logger.info(f"Reward: {reward}")
             time.sleep(7)
 
         print(f"---------------------------- trajectory {self.round} ----------------------------")
         self.update_obs()
-        self.text, self.round = self.task_reward_generator.task_generation(self.obs["right_image"])  # 6.860s
-        # print("task:", self.text)
-        obs_for_pi0 = self.get_obs_for_base()
-        action_base = self.get_online_action_base(obs_for_pi0)  # 0.093s
+        if self.evaluation ==False:
+            self.text, self.round = self.task_reward_generator.task_generation(self.obs["right_image"])
+        print("current task:", self.text)
+        if task_prompt==None:
+            obs_for_pi0 = self.get_obs_for_base(self.text)
+        else:
+            obs_for_pi0 = self.get_obs_for_base(task_prompt)
+        action_base = self.get_online_action_base(obs_for_pi0)
 
         # 标准化后的 base action
         self.base_action_buffer.clear()
@@ -238,9 +248,11 @@ class BasePolicy:
         
         obs = self.get_obs_for_residual(base_naction)
         
+        if task_prompt == None:
+            return obs, self.text
         return obs
 
-    def get_offline_action_base(self, raw_obs):
+    def get_offline_action_base(self, raw_obs, task_prompt):
         if len(self.base_action_buffer)==0:
             query_action_base = True
         else:
@@ -263,13 +275,13 @@ class BasePolicy:
                 "observation/exterior_image_2_left": image_tools.resize_with_pad(wrist_resized, 224, 224),
                 "observation/eef_position": eef_pose,
                 "observation/gripper_position": gripper_position,
-                "prompt": self.text,  # instruction
+                "prompt": task_prompt,  # instruction
             }
 
             pred_action_chunk = self.pi05_client.infer(request_data)["actions"]
             assert pred_action_chunk.shape == (50, 8) # 10,8
             # action = pred_action_chunk[0]
-            action = pred_action_chunk[:35]  # 30 # 20
+            action = pred_action_chunk[:35] # 35 # 30 # 20
             # action = action[::2]
 
             action = np.asarray(action).copy()
@@ -293,8 +305,8 @@ class BasePolicy:
         pred_action_chunk = self.pi05_client.infer(obs_for_pi0)["actions"]
         assert pred_action_chunk.shape == (50, 8) # 10,8
         # action = pred_action_chunk[0]
-        action = pred_action_chunk[:35]  # 30 # 20
-        # action = action[::2]   # down sampling ferequency
+        action = pred_action_chunk[:35]  # 35
+        # action = action[::2]   # down sampling frequency
 
         action = np.asarray(action).copy()
         action[:, -1] = (action[:, -1] > 0.9).astype(action.dtype) # 0.6 0.5
@@ -306,28 +318,44 @@ class BasePolicy:
         
         return action
 
-    def step(self, residual_action):
+    def step(self, residual_action, task_prompt = None, evaluation=False):
         # residual_action = torch.zeros_like(residual_action) ##
         residual_action[:, -1] = 0
         combined_action = self._last_base_action + residual_action
         unscaled_combined_action = self.action_scaler.unscale(combined_action)
-
+        self.evaluation = evaluation
         if len(self.base_action_buffer)<1:
             query_action_base = True
         else:
             query_action_base = False
         
         # next_action_chunk, done, reward = self.get_transition(combined_action=unscaled_combined_action, query_action_base = query_action_base) # TODO: terminated, truncated?
-        next_action_chunk, done = self.get_transition(combined_action=unscaled_combined_action, query_action_base = query_action_base) # TODO: terminated, truncated?
-        
-        if done:
-            next_obs = self.reset()
-            reward = self.reward
-            print("reward: ", reward)
 
+        next_action_chunk, done = self.get_transition(combined_action=unscaled_combined_action, query_action_base = query_action_base,task_prompt = task_prompt) # TODO: terminated, truncated?
+
+        # reward = 0.0
+        # if self.t_step > 100 and self.gripper_position < 0.3: # 0.00029025 0.21633916 and (self.t_step%10 ==0) 
+        #     self.update_obs()
+        #     reward = float(self.task_reward_generator.reward_generation(self.obs["right_image"]))  # 0 or 1
+        #     terminated = bool(reward)
+        #     done = terminated | done
+        #     print("reward: ", reward)
+        # if done:
+        #     next_obs = self.reset()
+        #     # reward = self.reward
+        #     # print("reward: ", reward)
+        # else:
+        #     # reward = 0.0  
+
+        if done:
+            if task_prompt ==None:
+                next_obs, task_prompt = self.reset()
+            else:
+                next_obs = self.reset(task_prompt=task_prompt)
+
+            reward = self.reward
         else:
             reward = 0.0
-
             if query_action_base:
                 self.base_action_buffer.clear()
                 for action_ in next_action_chunk:
@@ -340,22 +368,23 @@ class BasePolicy:
                 base_naction = base_naction.unsqueeze(0)
             next_obs = self.get_obs_for_residual(base_naction)
 
-            print("len(self.base_action_buffer)----------------------------->", len(self.base_action_buffer))
-            print("next_base_action_  :", next_base_action_)
-            print("residual_action    :", residual_action)
-            print("combined_action    :", unscaled_combined_action)
+            # print("len(self.base_action_buffer)----------------------------->", len(self.base_action_buffer))
+            # print("next_base_action_  :", next_base_action_)
+            # print("residual_action    :", residual_action)
+            # print("combined_action    :", unscaled_combined_action)
         
         info = {}
         info["scaled_action"] = combined_action
         info["combined_action"] = unscaled_combined_action
         info["residual_action"] = residual_action
+        info["task_prompt"] = self.text
 
         reward = torch.as_tensor([reward], dtype=torch.float32, device=self.device)
         done = torch.as_tensor([done], dtype=torch.bool, device=self.device)
 
         return next_obs, reward, done, info
 
-    def get_transition(self, combined_action, query_action_base):
+    def get_transition(self, combined_action, query_action_base, task_prompt):
         # 转成 numpy，并去掉 batch 维
         if isinstance(combined_action, torch.Tensor):
             combined_action = combined_action.detach().cpu().numpy()  # type: torch.Tensor
@@ -401,16 +430,18 @@ class BasePolicy:
         done = terminated | truncated
         
         if done:
-            # self.reset()
-            # reward = self.reward
+            combined_action[2] +=0.1
+            self.env.step(combined_action)
             done = done
             next_action_chunk = None
         else:
             if query_action_base:
-                obs_for_pi0 = self.get_obs_for_base()
+                if task_prompt ==None:
+                    obs_for_pi0 = self.get_obs_for_base(self.text)
+                else:
+                    obs_for_pi0 = self.get_obs_for_base(task_prompt)
                 next_action_chunk = self.get_online_action_base(obs_for_pi0)
             else:
                 next_action_chunk = None
-            # reward = 0.0
         
         return next_action_chunk, done # , reward

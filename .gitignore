@@ -10,3 +10,5 @@ deps/
 *.log
 .env
 **/.env
+*.png
+debug_images/

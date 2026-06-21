@@ -50,7 +50,7 @@ from resfit.lerobot.policies.act.modeling_act import ACTPolicy
 from resfit.lerobot.utils.load_policy import download_policy_from_wandb, load_policy
 from resfit.rl_finetuning.config.residual_td3 import ResidualTD3DexmgConfig
 from resfit.rl_finetuning.off_policy.common_utils import utils
-from resfit.rl_finetuning.off_policy.rl.q_agent import QAgent
+from resfit.rl_finetuning.off_policy.rl.q_agent_lang import QAgentLang
 from resfit.rl_finetuning.utils.dtype import to_uint8
 from resfit.rl_finetuning.utils.evaluate_dexmg import run_dexmg_evaluation
 from resfit.rl_finetuning.utils.evaluate_franka import run_franka_evaluation
@@ -59,6 +59,9 @@ from resfit.rl_finetuning.utils.hugging_face import (
     _hf_upload_buffer,
     optimized_replay_buffer_dumps,
     optimized_replay_buffer_loads,
+)
+from resfit.rl_finetuning.config.rlpd import (
+    LanguageConfig,
 )
 from resfit.rl_finetuning.utils.normalization import ActionScaler, StateStandardizer
 from resfit.rl_finetuning.utils.rb_transforms import MultiStepTransform
@@ -110,6 +113,140 @@ class TrainingTimer:
         """Reset all timing data."""
         self.times = defaultdict(list)
         self.reset_time = time.perf_counter()
+
+
+# -----------------------------------------------------------------------------
+# Language embedding helper ---------------------------------------------------
+# -----------------------------------------------------------------------------
+class LanguageEmbedder:
+    """Compute a fixed sentence embedding for a task / prompt string.
+
+    Frozen, lazy-loaded; the result is cached per string so we never re-run
+    the LM during data collection.
+
+    Default backend: ``sentence-transformers/all-MiniLM-L6-v2`` -> 384-dim
+    embedding.  Swap ``model_name`` for any other HuggingFace sentence /
+    text encoder; just keep ``cfg.agent.language.lang_emb_dim`` in sync.
+
+    If the ``sentence-transformers`` package is missing, falls back to a
+    deterministic hashed pseudo-embedding so the rest of the training
+    pipeline still runs (useful for plumbing checks).
+    """
+
+    def __init__(
+        self,
+        *,
+        emb_dim: int,
+        device: torch.device,
+        model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+    ) -> None:
+        self.emb_dim = emb_dim
+        self.device = device
+        self.model_name = model_name
+        self._cache: dict[str, torch.Tensor] = {}
+        self._model = None
+        self._loaded = False
+
+    def _maybe_load(self) -> None:
+        if self._loaded:
+            return
+        self._loaded = True
+        try:
+            from sentence_transformers import SentenceTransformer
+
+            self._model = SentenceTransformer(self.model_name, device=str(self.device))
+            self._model.eval()
+            actual_dim = int(self._model.get_sentence_embedding_dimension())
+            assert actual_dim == self.emb_dim, (
+                f"LanguageEmbedder: model '{self.model_name}' produces {actual_dim}-dim "
+                f"embeddings but cfg.agent.language.lang_emb_dim={self.emb_dim}. "
+                f"Either change the model or update the config."
+            )
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"⚠️  LanguageEmbedder: could not load '{self.model_name}' ({e}); "
+                f"falling back to deterministic hashed pseudo-embeddings. "
+                f"Install sentence-transformers for real embeddings."
+            )
+            self._model = None
+
+    def encode(self, text: str) -> torch.Tensor:
+        if text in self._cache:
+            return self._cache[text]
+        self._maybe_load()
+        if self._model is not None:
+            with torch.no_grad():
+                vec = self._model.encode(
+                    text,
+                    convert_to_tensor=True,
+                    normalize_embeddings=True,
+                ).to(self.device).float()
+        else:
+            seed = abs(hash(text)) % (2**31 - 1)
+            g = torch.Generator(device="cpu").manual_seed(seed)
+            vec = torch.randn(self.emb_dim, generator=g)
+            vec = (vec / vec.norm()).to(self.device).float()
+        self._cache[text] = vec
+        return vec
+
+    def __call__(self, text: str) -> torch.Tensor:
+        return self.encode(text)
+
+def _load_lerobot_task_prompts(dataset: LeRobotDataset, dataset_name: str) -> dict[int, str]:
+    """Read ``meta/tasks.jsonl`` and return task_index -> prompt."""
+    candidate_paths: list[Path] = []
+
+    dataset_root = getattr(dataset, "root", None)
+    if dataset_root is not None:
+        candidate_paths.append(Path(dataset_root) / "meta" / "tasks.jsonl")
+
+    dataset_meta_root = getattr(getattr(dataset, "meta", None), "root", None)
+    if dataset_meta_root is not None:
+        candidate_paths.append(Path(dataset_meta_root) / "tasks.jsonl")
+        candidate_paths.append(Path(dataset_meta_root) / "meta" / "tasks.jsonl")
+
+    name_path = Path(dataset_name).expanduser()
+    candidate_paths.append(name_path / "meta" / "tasks.jsonl")
+    candidate_paths.append(name_path / "tasks.jsonl")
+
+    tasks_path = next((path for path in candidate_paths if path.exists()), None)
+    if tasks_path is None:
+        searched = "\n  ".join(str(path) for path in candidate_paths)
+        raise FileNotFoundError(f"Could not find LeRobot tasks.jsonl. Searched:\n  {searched}")
+
+    task_prompts: dict[int, str] = {}
+    with tasks_path.open("r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            if "task_index" not in row or "task" not in row:
+                raise KeyError(f"{tasks_path}:{line_no} must contain 'task_index' and 'task'")
+            task_prompts[int(row["task_index"])] = str(row["task"])
+
+    if not task_prompts:
+        raise ValueError(f"No task prompts found in {tasks_path}")
+
+    print(f"Loaded {len(task_prompts)} task prompts from {tasks_path}")
+    return task_prompts
+
+def _inject_task_emb(
+    obs: dict[str, torch.Tensor], task_emb: torch.Tensor, key: str = "observation.task_emb"
+) -> dict[str, torch.Tensor]:
+    """Set ``obs[key]`` to ``task_emb`` (broadcast to whatever batch dim the
+    rest of obs has).  Mutates ``obs`` in place and returns it for chaining.
+    """
+    # print("type(obs)::::::::::::::::::", type(obs))
+    if key in obs:
+        return obs
+    state = obs.get("observation.state", None)
+    if state is not None and state.dim() == 2:
+        emb = task_emb.unsqueeze(0).expand(state.size(0), -1).contiguous()
+    else:
+        emb = task_emb
+    obs[key] = emb.to(state.device if state is not None else task_emb.device)
+    return obs
 
 
 # -----------------------------------------------------------------------------
@@ -234,6 +371,7 @@ def save_training_checkpoint(
         "actor": agent.actor.state_dict(),
         "critic": agent.critic.state_dict(),
         "encoders": agent.encoders.state_dict(),
+        "lang_encoder": agent.lang_encoder.state_dict(),
         "actor_target": agent.actor_target.state_dict(),
         "critic_target": agent.critic_target.state_dict(),
 
@@ -445,6 +583,8 @@ def _add_transitions_to_buffer(
 
 def collector_loop(
         cfg,
+        lang_cfg,
+        lang_embedder,
         device,
         base_policy,
         image_keys,
@@ -469,8 +609,15 @@ def collector_loop(
         episode_idx = int(initial_episode_count)
         best_eval_success_rate = initial_best_eval_success_rate
 
-        obs = base_policy.reset()
-        agent = QAgent(obs_shape=(img_c, img_h, img_w),
+        # obs = base_policy.reset()
+        def _attach_task_emb(obs, task_emb):
+            if not lang_cfg.enabled or task_emb is None or obs is None:
+                return obs
+            return _inject_task_emb(obs, task_emb, key=lang_cfg.lang_emb_obs_key)
+        obs, task_prompt = base_policy.reset()
+        task_emb = lang_embedder(task_prompt)
+        obs = _attach_task_emb(obs, task_emb)
+        agent = QAgentLang(obs_shape=(img_c, img_h, img_w),
                             prop_shape=(lowdim_dim,),
                             action_dim=action_dim,
                             rl_cameras=image_keys,
@@ -489,6 +636,7 @@ def collector_loop(
                 agent.actor.load_state_dict(latest["actor"])
                 agent.encoders.load_state_dict(latest["encoders"])
                 agent.critic.load_state_dict(latest["critic"])
+                agent.lang_encoder.load_state_dict(latest["lang_encoder"])
                 # print("[collector] rollout actor updated #########################" )
 
 
@@ -512,7 +660,10 @@ def collector_loop(
                     action = action * clip_factor  # 让 residual policy 在训练早期影响较小，避免一开始破坏 base policy
 
                 next_obs, reward, done, info = base_policy.step(residual_action=action)
-
+                if done:
+                    task_prompt = info["task_prompt"]
+                    task_emb = lang_embedder(task_prompt)
+                next_obs = _attach_task_emb(next_obs, task_emb)
                 if done.any():
                     episode_count += done.float().sum().item()
                     episode_done = True
@@ -560,14 +711,20 @@ def collector_loop(
                         save_q_plots=cfg.save_video,  # Enable Q-plots when video saving is enabled
                         run_name=run_name,
                         output_dir=outputs_dir,
+                        lang_cfg = lang_cfg,
+                        lang_embedder= lang_embedder,
                     )
 
                     # Handle model saving when success rate improves
-                    current_success_rate = eval_metrics["eval/success_rate"]
-                    if current_success_rate > best_eval_success_rate:
-                        print(f"🎉 New best success rate: {current_success_rate:.4f} (prev: {best_eval_success_rate:.4f})")
-                        best_eval_success_rate = current_success_rate
-                obs = base_policy.reset()
+                    current_success_rate_task_one = eval_metrics["eval/success_rate_task_one"]
+                    current_success_rate_task_two = eval_metrics["eval/success_rate_task_two"]
+                    # if current_success_rate > best_eval_success_rate:
+                    print(f"🎉 task one success rate: {current_success_rate_task_one}")
+                    print(f"🎉 task two success rate: {current_success_rate_task_two}")
+                        # best_eval_success_rate = current_success_rate
+                obs, task_prompt = base_policy.reset()
+                task_emb = lang_embedder(task_prompt)
+                obs = _attach_task_emb(obs, task_emb)
             # 原来 eval 后会 reset，这里 episode 结束也 reset
             # obs = base_policy.reset()
             
@@ -619,14 +776,16 @@ def learner_loop(
         weights_queue.put({
             "actor": {k: v.detach().cpu() for k, v in agent.actor.state_dict().items()},
             "encoders": {k: v.detach().cpu() for k, v in agent.encoders.state_dict().items()},
-            "critic": {k: v.detach().cpu() for k, v in agent.critic.state_dict().items()}
+            "critic": {k: v.detach().cpu() for k, v in agent.critic.state_dict().items()},
+            "lang_encoder": {k: v.detach().cpu() for k, v in agent.lang_encoder.state_dict().items()}
         })
 
         def _publish_latest_actor():
             payload = {
                 "actor": {k: v.detach().cpu() for k, v in agent.actor.state_dict().items()},
                 "encoders": {k: v.detach().cpu() for k, v in agent.encoders.state_dict().items()},
-                "critic": {k: v.detach().cpu() for k, v in agent.critic.state_dict().items()}
+                "critic": {k: v.detach().cpu() for k, v in agent.critic.state_dict().items()},
+                "lang_encoder": {k: v.detach().cpu() for k, v in agent.lang_encoder.state_dict().items()}
             }
             # 保持 queue 里尽量只有最新
             try:
@@ -834,12 +993,9 @@ def learner_loop(
 # Main training loop -----------------------------------------------------------
 # -----------------------------------------------------------------------------
 def main(cfg: ResidualTD3DexmgConfig):
-    print("cfg.algo.random_action_noise_scale:::::", cfg.algo.random_action_noise_scale)
-    print("cfg.task:::::", cfg.task)
     device_str = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device_str)
     enc_type=cfg.agent.enc_type
-    print("agent.enc_type:::::", enc_type)
 
     # Enable performance optimizations
     if device.type == "cuda":
@@ -947,9 +1103,27 @@ def main(cfg: ResidualTD3DexmgConfig):
     lowdim_keys = ["observation.state", "observation.base_action"]
 
     # ---------------------------------------------------------------------
+    # Language / task embedding -------------------------------------------
+    # ---------------------------------------------------------------------
+    lang_cfg: LanguageConfig = cfg.agent.language
+    if lang_cfg.enabled:
+        lang_embedder = LanguageEmbedder(
+            emb_dim=lang_cfg.lang_emb_dim,
+            device=device,
+        )
+        # task_emb = lang_embedder(cfg.task)
+        # print(f"🗣  task='{cfg.task}' -> task_emb shape={tuple(task_emb.shape)}")
+        dataset_task_prompts = _load_lerobot_task_prompts(dataset, cfg.offline_data.name)
+        lowdim_keys = ["observation.state", "observation.base_action", lang_cfg.lang_emb_obs_key]
+    else:
+        lang_embedder = None
+        dataset_task_prompts = {}
+        lowdim_keys = ["observation.state", "observation.base_action"]
+
+    # ---------------------------------------------------------------------
     # Networks ------------------------------------------------------------
     # ---------------------------------------------------------------------
-    agent = QAgent(
+    agent = QAgentLang(
         obs_shape=(img_c, img_h, img_w),
         prop_shape=(lowdim_dim,),
         action_dim=action_dim,
@@ -957,6 +1131,11 @@ def main(cfg: ResidualTD3DexmgConfig):
         cfg=cfg.agent,
         residual_actor=True,  # Enable residual actor mode
     ) 
+    
+    def _attach_task_emb(obs, task_emb):
+        if not lang_cfg.enabled or task_emb is None or obs is None:
+            return obs
+        return _inject_task_emb(obs, task_emb, key=lang_cfg.lang_emb_obs_key)
 
     # horizon = env.vec_env.metadata["horizon"]  # todo
     horizon = cfg.offline_data.horizon
@@ -1170,7 +1349,9 @@ def main(cfg: ResidualTD3DexmgConfig):
                 with torch.no_grad():
                     # base_action = base_policy.select_action(raw_obs)
                     # _, base_action, _, _, _ = base_policy.get_obs_and_base_action(raw_obs=raw_obs)  # todo done
-                    base_action = base_policy.get_offline_action_base(raw_obs)  # base_action shape:(8,)
+                    task_index = int(sample["task_index"].item())
+                    task_prompt = dataset_task_prompts[task_index]
+                    base_action = base_policy.get_offline_action_base(raw_obs, task_prompt)  # base_action shape:(8,)
                 base_action = torch.as_tensor(base_action, dtype=torch.float32)
                 base_action_scaled = action_scaler.scale(base_action.cpu())
             else:
@@ -1189,6 +1370,22 @@ def main(cfg: ResidualTD3DexmgConfig):
             curr_obs = process_image_batch(curr_obs, image_keys, enc_type, rb=True)  ###
             # Convert images to uint8 for memory-efficient storage
             to_uint8(curr_obs, image_keys)
+
+            # Inject task embedding from the dataset's per-frame task_index.
+            if lang_cfg.enabled:
+                if lang_embedder is None:
+                    raise RuntimeError("lang_embedder must be initialized when language is enabled")
+                if "task_index" not in sample:
+                    raise KeyError("Dataset sample is missing 'task_index'; cannot build task embedding")
+                task_index = int(sample["task_index"].item())
+                if task_index not in dataset_task_prompts:
+                    raise KeyError(
+                        f"task_index={task_index} was not found in tasks.jsonl "
+                        f"(available: {sorted(dataset_task_prompts)})"
+                    )
+                task_prompt = dataset_task_prompts[task_index]
+                curr_task_emb = lang_embedder(task_prompt)
+                curr_obs[lang_cfg.lang_emb_obs_key] = curr_task_emb.detach().cpu()
 
             # ------------------------------------------------------------------
             # If we already cached the *previous* frame for this episode we can
@@ -1324,7 +1521,14 @@ def main(cfg: ResidualTD3DexmgConfig):
     if len(online_rb) < cfg.algo.learning_starts and not loaded_online_from_cache and not getattr(cfg, "resume", False):
         print(f"Warm-up: filling online buffer with {cfg.algo.learning_starts - len(online_rb)} random steps…")
         # obs, _ = env.reset()
-        obs = base_policy.reset() # todo reset
+        # obs = base_policy.reset() # todo reset
+        # task_one = "pick up the cube and place it into the bowl"
+        # task_two = "pick up the cube from the bowl and place it outside the bowl"
+        # task_prompt = task_one
+        # task_emb = lang_embedder(task_prompt)
+        obs, task_prompt = base_policy.reset()
+        task_emb = lang_embedder(task_prompt)
+        obs = _attach_task_emb(obs= obs,task_emb=task_emb)
         # --------------------------------------------------------------
         # Logging helper: print progress every 1 000 collected transitions
         # --------------------------------------------------------------
@@ -1359,14 +1563,21 @@ def main(cfg: ResidualTD3DexmgConfig):
 
             # next_obs, base_action, reward, terminated, truncated, info = base_policy.step(residual_action=rand_actions) # todo need to return  reward, terminated, truncated, info  normalize 
             # done = terminated | truncated
-            next_obs, reward, done, info = base_policy.step(residual_action=rand_actions) # todo need to return  reward, terminated, truncated, info  normalize 
+            next_obs, reward, done, info = base_policy.step(residual_action=rand_actions ) # todo need to return  reward, terminated, truncated, info  normalize 
             # print(f"[warmup] after step: reward={reward}, done={done}")
-
+            task_prompt = info["task_prompt"]
+            task_emb = lang_embedder(task_prompt)
+            next_obs = _attach_task_emb(next_obs, task_emb)
             reward_sum += reward.sum().item()
             episode_count += done.float().sum().item()
             # reward_sum += reward
             # episode_count += int(done)
-
+            if done:
+                if reward>0:
+                    res = "✓"
+                else:
+                    res = "✗"
+                print(f"task: {task_prompt} : {res}")
             # Use the executed combined action returned by the environment
             combined_action = info["scaled_action"]
             _add_transitions_to_buffer(  # line5: Add transition (st, atb, at, st+1, atb+1, rt, dt) to online replay buffer
@@ -1383,6 +1594,7 @@ def main(cfg: ResidualTD3DexmgConfig):
                 online_rb=online_rb,
                 enc_type=enc_type
             )
+            
 
             # ----------------------------------------------------------
             # Progress logging (every ~1 000 transitions) --------------
@@ -1521,7 +1733,7 @@ def main(cfg: ResidualTD3DexmgConfig):
     outputs_dir.mkdir(parents=True, exist_ok=True)
 
     # obs, _ = env.reset()
-    obs = base_policy.reset() # todo reset
+    # obs = base_policy.reset() # todo reset
 
     train_start_time = time.time()
 
@@ -1616,6 +1828,8 @@ def main(cfg: ResidualTD3DexmgConfig):
         collector_thread = threading.Thread(
             target=collector_loop,
             args=( cfg,
+                    lang_cfg,
+                    lang_embedder,
                     device,
                     base_policy,
                     image_keys,

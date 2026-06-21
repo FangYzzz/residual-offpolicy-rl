@@ -17,9 +17,12 @@ from PIL import Image, ImageDraw
 
 import wandb
 # from resfit.dexmg.environments.dexmg import VectorizedEnvWrapper
-from resfit.rl_finetuning.off_policy.rl.q_agent import QAgent
-from resfit.rl_finetuning.scripts.residual_client import ResidualClient
-
+from resfit.rl_finetuning.off_policy.rl.q_agent_lang import QAgentLang
+from resfit.rl_finetuning.scripts.gpt_residual_robot import BasePolicy
+from loguru import logger
+import sys
+import os
+from datetime import datetime
 
 def process_image_batch_dim(obs_dict, image_keys, out_size=84):
     """
@@ -74,10 +77,72 @@ def _to_xyz_steps(arr) -> np.ndarray:
     else:
         return arr.reshape(-1)[None, :3]
 
+def setup_logger():
+        log_dir = f"outputs/task_reward_generation/{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        log_path = os.path.join(log_dir, "log.txt")
+
+        logger.remove()
+        logger.add(log_path, format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}", level="INFO")
+        logger.add(sys.stdout, colorize=True, format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | {message}")
 
 # ----------------------------------------------------------------------
 # Plotting
 # ----------------------------------------------------------------------
+
+
+def _plot_residual_per_dim(
+    trajectories: list[np.ndarray],
+    successes: list[bool],
+    title_prefix: str = "Residual action",
+    global_step: int | None = None,
+):
+    """
+    Residual action 可视化：
+      - x 轴: episode step
+      - y 轴: residual action 数值
+      - 三个子图分别对应 x / y / z 维度
+      - 成功 episode 绿色，失败红色
+    """
+    fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+    dim_names = ["x", "y", "z"]
+
+    drew_success_label = False
+    drew_fail_label = False
+    for traj, ok in zip(trajectories, successes):
+        if traj.shape[0] == 0:
+            continue
+        steps = np.arange(traj.shape[0])
+        color = "tab:green" if ok else "tab:red"
+
+        for d in range(3):
+            label = None
+            if ok and not drew_success_label and d == 0:
+                label = "success"
+            elif (not ok) and not drew_fail_label and d == 0:
+                label = "fail"
+            axes[d].plot(
+                steps, traj[:, d],
+                color=color, alpha=0.6, linewidth=1.0, label=label,
+            )
+        if ok:
+            drew_success_label = True
+        else:
+            drew_fail_label = True
+
+    title_suffix = f" (step={global_step})" if global_step is not None else ""
+    for d, name in enumerate(dim_names):
+        axes[d].set_ylabel(f"residual {name}")
+        axes[d].grid(True, alpha=0.3)
+        axes[d].axhline(0.0, color="k", linewidth=0.5, alpha=0.4)
+    axes[0].set_title(f"{title_prefix} per-dim over steps{title_suffix}")
+    axes[-1].set_xlabel("episode step")
+    if axes[0].get_legend_handles_labels()[0]:
+        axes[0].legend(loc="best", fontsize=8)
+
+    fig.tight_layout()
+    return fig
+
+
 def _plot_xyz_trajectories(
     trajectories: list[np.ndarray],
     successes: list[bool],
@@ -182,13 +247,35 @@ def _plot_q_trajectories(
     return fig
 
 
+
+def _inject_task_emb(
+    obs: dict[str, torch.Tensor], task_emb: torch.Tensor, key: str = "observation.task_emb"
+) -> dict[str, torch.Tensor]:
+    """Set ``obs[key]`` to ``task_emb`` (broadcast to whatever batch dim the
+    rest of obs has).  Mutates ``obs`` in place and returns it for chaining.
+    """
+    if key in obs:
+        return obs
+    state = obs.get("observation.state", None)
+    if state is not None and state.dim() == 2:
+        emb = task_emb.unsqueeze(0).expand(state.size(0), -1).contiguous()
+    else:
+        emb = task_emb
+    obs[key] = emb.to(state.device if state is not None else task_emb.device)
+    return obs
+
+def _attach_task_emb(obs, lang_cfg, task_emb):
+            if not lang_cfg.enabled or task_emb is None or obs is None:
+                return obs
+            return _inject_task_emb(obs, task_emb, key=lang_cfg.lang_emb_obs_key)
+
 # ----------------------------------------------------------------------
 # Main eval loop
 # ----------------------------------------------------------------------
 def run_franka_evaluation(
     *,
-    env: ResidualClient,
-    agent: QAgent,
+    env: BasePolicy,
+    agent: QAgentLang,
     num_episodes: int = 20,
     device: torch.device | str = "cuda",
     global_step: int | None = None,
@@ -196,32 +283,45 @@ def run_franka_evaluation(
     save_q_plots: bool = True,
     run_name: str | None = None,
     output_dir: str | Path | None = "outputs",
+    lang_cfg,
+    lang_embedder
 ) -> tuple[dict[str, float], float]:
     device = torch.device(device)
     agent.eval()
-
     num_envs: int = env.num_envs if hasattr(env, "num_envs") else 1
-
+    setup_logger()
+    logger.info("-------------------------------eval--------------------------------")
+    successes_task_one: list[bool] = []
+    successes_task_two: list[bool] = []
     successes: list[bool] = []
-
+    switched = False
     # 每 episode 的缓冲
     ep_combined_buffers: list[list[np.ndarray]] = [[] for _ in range(num_envs)]
     ep_residual_buffers: list[list[np.ndarray]] = [[] for _ in range(num_envs)]
-    ep_q_preds: list[list[float]] = [[] for _ in range(num_envs)]
+    ep_q_preds_task_one: list[list[float]] = [[] for _ in range(num_envs)]
+    ep_q_preds_task_two: list[list[float]] = [[] for _ in range(num_envs)]
 
     # 已完成 episode 聚合
     all_combined_trajs: list[np.ndarray] = []
     all_residual_trajs: list[np.ndarray] = []
-    all_q_trajectories: list[list[float]] = []
-    all_episode_lengths: list[int] = []
+    all_q_trajectories_task_one: list[list[float]] = []
+    all_q_trajectories_task_two: list[list[float]] = []
+    # all_episode_lengths: list[int] = []
 
     frame_buffer: list[list[np.ndarray]] | None = [[] for _ in range(num_envs)] if save_video else None
 
     done_episodes = 0
-    obs = env.reset()
+    # task_one = "pick up the cube and place it into the bowl"
+    # task_two = "pick up the cube from the bowl and place it outside the bowl"
+    task_one = "put the cube into the bowl"
+    task_two = "put the cube outside the bowl"
+    obs, task_prompt = env.reset()
+    task_prompt = task_one
+    task_emb = lang_embedder(task_prompt)
+    obs = _attach_task_emb(obs,lang_cfg, task_emb)
 
-    progress_dots = ["."] * num_episodes
-    print(f"Evaluating {num_episodes} episodes: {''.join(progress_dots)}", end="", flush=True)
+    progress_dots = ["."] * num_episodes*2
+    logger.info(f"Evaluating {num_episodes*2} episodes: {''.join(progress_dots)}", end="", flush=True)
     image_keys = [
         # "observation.images.head_view",
         # "observation.images.wrist_right_view",
@@ -231,16 +331,18 @@ def run_franka_evaluation(
         "observation.images.exterior_image_2_left",
     ]
 
-    while done_episodes < num_episodes:
+    while done_episodes < num_episodes*2:
         # -----------------------------------------------------------
         # 1. Policy + Q prediction
         # -----------------------------------------------------------
         with torch.no_grad():
             obs = process_image_batch_dim(obs, image_keys, out_size=84)
+            # obs = _attach_task_emb(obs,lang_cfg, task_emb)
             actions = q_actions = agent.act(obs, eval_mode=True, stddev=0.0, cpu=False)
 
+            obs_q = agent._augment_state(obs, detach_lang=True)
             # On-the-fly features for Q-value prediction
-            obs_q = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in obs.items()}
+            obs_q = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in obs_q.items()}
             obs_q["feat"] = agent._encode(obs_q, augment=False)
 
             if getattr(agent, "residual_actor", False) and "observation.base_action" in obs:
@@ -255,7 +357,8 @@ def run_franka_evaluation(
         # -----------------------------------------------------------
         # 2. Env step
         # -----------------------------------------------------------
-        next_obs, reward, done, info = env.step(actions)
+        next_obs, reward, done, info = env.step(actions, task_prompt=task_prompt, evaluation = True)
+
         combined_action = info["combined_action"]
         residual_action = info["residual_action"]
         done_flags = done
@@ -270,19 +373,25 @@ def run_franka_evaluation(
             ep_combined_buffers[env_idx].append(combined_xyz.copy())
             ep_residual_buffers[env_idx].append(residual_xyz.copy())
             q_val = q_pred[env_idx].item() if q_pred.numel() > env_idx else float(q_pred.mean().item())
-            ep_q_preds[env_idx].append(q_val)
+            if done_episodes< num_episodes:
+                ep_q_preds_task_one[env_idx].append(q_val)
+            else:
+                ep_q_preds_task_two[env_idx].append(q_val)
 
         # -----------------------------------------------------------
         # 4. Episode 结束
         # -----------------------------------------------------------
         if done_flags:
-            is_success = bool(reward.item() > 0.9)
-            print("rw:", reward.item())
+            is_success = bool(reward.item() > 0.9)           
             progress_dots[done_episodes] = "✓" if is_success else "✗"
-            print(f"\rEvaluating {num_episodes} episodes: {''.join(progress_dots)}", end="", flush=True)
-
+            # logger.info(f"{reward}: {reward}")
+            logger.info(f"{task_prompt}: {progress_dots[done_episodes]}")
+            logger.info(f"Evaluating {num_episodes*2} episodes: {''.join(progress_dots)}", end="", flush=True)
+            if done_episodes< num_episodes:
+                successes_task_one.append(is_success)
+            else:
+                successes_task_two.append(is_success)
             successes.append(is_success)
-
             combined_traj = (
                 np.concatenate(ep_combined_buffers[0], axis=0)
                 if ep_combined_buffers[0] else np.zeros((0, 3))
@@ -294,40 +403,63 @@ def run_franka_evaluation(
             all_combined_trajs.append(combined_traj)
             all_residual_trajs.append(residual_traj)
 
-            all_q_trajectories.append(ep_q_preds[0].copy())
-            all_episode_lengths.append(len(ep_q_preds[0]))
+            all_q_trajectories_task_one.append(ep_q_preds_task_one[0].copy())
+            all_q_trajectories_task_two.append(ep_q_preds_task_two[0].copy())
+            # all_episode_lengths.append(len(ep_q_preds[0]))
 
             ep_combined_buffers[0] = []
             ep_residual_buffers[0] = []
-            ep_q_preds[0] = []
+
+            ep_q_preds_task_one[0] = []
+            ep_q_preds_task_two[0] = []
 
             done_episodes += 1
 
+            if done_episodes== num_episodes:
+
+                task_prompt = task_two
+                if switched ==False:
+                    logger.info("-----------------------switch to task two-------------------------")
+                    switched = True
+                next_obs = env.reset(task_prompt)
+    
+            task_emb = lang_embedder(task_prompt)
+        next_obs = _attach_task_emb(next_obs,lang_cfg, task_emb)
         obs = next_obs
 
-    print("Done")
+    logger.info("Done")
+    env.evaluation = False
 
     # ------------------------------------------------------------------
     # 5. Aggregate metrics + Q stats
     # ------------------------------------------------------------------
-    success_rate: float = float(np.mean(successes)) if successes else 0.0
+    success_rate_task_one: float = float(np.mean(successes_task_one)) if successes_task_one else 0.0
+    success_rate_task_two: float = float(np.mean(successes_task_two)) if successes_task_two else 0.0
 
-    flat_q = (
-        np.concatenate([np.asarray(t, dtype=np.float32) for t in all_q_trajectories if len(t) > 0])
-        if any(len(t) > 0 for t in all_q_trajectories)
+    flat_q_task_one = (
+        np.concatenate([np.asarray(t, dtype=np.float32) for t in all_q_trajectories_task_one if len(t) > 0])
+        if any(len(t) > 0 for t in all_q_trajectories_task_one)
         else np.zeros((0,), dtype=np.float32)
     )
-    succ_q = [np.mean(t) for t, ok in zip(all_q_trajectories, successes) if ok and len(t) > 0]
-    fail_q = [np.mean(t) for t, ok in zip(all_q_trajectories, successes) if (not ok) and len(t) > 0]
+
+    flat_q_task_two = (
+        np.concatenate([np.asarray(t, dtype=np.float32) for t in all_q_trajectories_task_two if len(t) > 0])
+        if any(len(t) > 0 for t in all_q_trajectories_task_two)
+        else np.zeros((0,), dtype=np.float32)
+    )
+    # succ_q = [np.mean(t) for t, ok in zip(all_q_trajectories, successes) if ok and len(t) > 0]
+    # fail_q = [np.mean(t) for t, ok in zip(all_q_trajectories, successes) if (not ok) and len(t) > 0]
 
     metrics: dict[str, float] = {
-        "eval/success_rate": success_rate,
-        "eval/q_mean": float(flat_q.mean()) if flat_q.size else 0.0,
-        "eval/q_std": float(flat_q.std()) if flat_q.size else 0.0,
-        "eval/q_min": float(flat_q.min()) if flat_q.size else 0.0,
-        "eval/q_max": float(flat_q.max()) if flat_q.size else 0.0,
-        "eval/q_mean_success": float(np.mean(succ_q)) if succ_q else 0.0,
-        "eval/q_mean_failure": float(np.mean(fail_q)) if fail_q else 0.0,
+        "eval/success_rate_task_one": success_rate_task_one,
+        "eval/success_rate_task_two": success_rate_task_two,
+        "eval/q_mean_task_one": float(flat_q_task_one.mean()) if flat_q_task_one.size else 0.0,
+        "eval/q_mean_task_two": float(flat_q_task_two.mean()) if flat_q_task_two.size else 0.0,
+        # "eval/q_std": float(flat_q.std()) if flat_q.size else 0.0,
+        # "eval/q_min": float(flat_q.min()) if flat_q.size else 0.0,
+        # "eval/q_max": float(flat_q.max()) if flat_q.size else 0.0,
+        # "eval/q_mean_success": float(np.mean(succ_q)) if succ_q else 0.0,
+        # "eval/q_mean_failure": float(np.mean(fail_q)) if fail_q else 0.0,
     }
 
     # ------------------------------------------------------------------
@@ -337,11 +469,14 @@ def run_franka_evaluation(
         all_combined_trajs, successes,
         title_prefix="Combined action", global_step=global_step,
     )
-    fig_residual = _plot_xyz_trajectories(
+    fig_residual = _plot_residual_per_dim(
         all_residual_trajs, successes,
         title_prefix="Residual action", global_step=global_step,
     )
-    fig_q = _plot_q_trajectories(all_q_trajectories, successes, global_step=global_step) \
+    fig_q_task_one = _plot_q_trajectories(all_q_trajectories_task_one, successes, global_step=global_step) \
+        if save_q_plots else None
+    
+    fig_q_task_two = _plot_q_trajectories(all_q_trajectories_task_two, successes, global_step=global_step) \
         if save_q_plots else None
 
     if wandb.run is not None:
@@ -350,14 +485,20 @@ def run_franka_evaluation(
             "eval/xyz_trajectories_combined": wandb.Image(fig_combined),
             "eval/xyz_trajectories_residual": wandb.Image(fig_residual),
         }
-        if fig_q is not None:
-            log_dict["eval/q_trajectories"] = wandb.Image(fig_q)
+        if fig_q_task_one is not None:
+            log_dict["eval/q_trajectories_taks_one"] = wandb.Image(fig_q_task_one)
+        if fig_q_task_one is not None:
+            log_dict["eval/q_trajectories_taks_two"] = wandb.Image(fig_q_task_two)
         wandb.log(log_dict, step=global_step)
 
     plt.close(fig_combined)
     plt.close(fig_residual)
-    if fig_q is not None:
-        plt.close(fig_q)
+    if fig_q_task_one is not None:
+        plt.close(fig_q_task_one)
+    if fig_q_task_two is not None:
+        plt.close(fig_q_task_two)
+
+    logger.info("--------------------------------------------------------------------------------------")
 
     agent.train(True)
     return metrics

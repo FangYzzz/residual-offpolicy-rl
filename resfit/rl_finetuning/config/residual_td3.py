@@ -30,6 +30,7 @@ class WandBConfig:
     entity: str | None = None
     notes: str | None = None
     continue_run_id: str | None = None
+    resume_checkpoint_run: bool = True  # True 不重开 wandb, False: 重开 wandb
     name: str | None = None
     group: str | None = None
 
@@ -65,8 +66,8 @@ class ResidualTD3AlgoConfig(RLPDAlgoConfig):
     # ------------------------------------------------------------------
     # Standard deviation schedule -------------------------------------------
     # ------------------------------------------------------------------
-    stddev_max: float = 0.05
-    stddev_min: float = 0.05
+    stddev_max: float = 0.008 # 0.05
+    stddev_min: float = 0.008 # 0.05
     stddev_step: int = 300_000
 
     # Progressive clipping schedule for the residual actions
@@ -119,16 +120,16 @@ class ResidualTD3DexmgConfig(RLPDDexmgConfig):
     # ------------------------------------------------------------------
     # Logging / checkpointing
     # ------------------------------------------------------------------
-    eval_interval_every_steps: int = 7000  ### 10_000
+    eval_interval_every_steps: int = 10_000  ### 10_000
 
     # Whether to run an evaluation pass before training begins (at step 0)
-    eval_first: bool = True
+    eval_first: bool = True  ### True
 
     resume: bool = False
     resume_checkpoint: str | None = None
-    checkpoint_interval: int = 10000  ###
+    checkpoint_interval: int = 1000  ### 5000
     save_replay_on_checkpoint: bool = False
-    save_online_rb_interval: int = 5000  ###
+    save_online_rb_interval: int = 1000  ### 5000
     send_transitions_len : int = 1  ### 
 
 @dataclass
@@ -263,9 +264,11 @@ class ResidualTD3FrankaCubeConfig(ResidualTD3DexmgConfig):
 
     offline_data: OfflineDataConfig = field(
         default_factory=lambda: OfflineDataConfig(
-            name="/home/yuan/self_vla/tele_op/lerobot/cube",
+            name="/home/yuan/self_vla/tele_op/lerobot/cube_fix_in50_out30",
+            # name="/home/yuan/self_vla/tele_op/lerobot/cube_in50_out50",
+            # name="/home/yuan/self_vla/tele_op/lerobot/cube_done",
             num_episodes=1_000,
-            horizon=400,   # 这里改成真实 episode 长度
+            horizon=140,   # 这里改成真实 episode 长度
         )
     )
     base_policy: BasePolicyConfig = field(
