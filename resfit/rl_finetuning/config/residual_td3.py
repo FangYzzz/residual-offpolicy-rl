@@ -131,6 +131,7 @@ class ResidualTD3DexmgConfig(RLPDDexmgConfig):
     save_replay_on_checkpoint: bool = False
     save_online_rb_interval: int = 1000  ### 5000
     send_transitions_len : int = 1  ### 
+    chunk_len: int = 4  # residual action chunk length H (actor/critic act_dim = H * per_step_dim)
 
 @dataclass
 class ResidualTD3CanConfig(ResidualTD3DexmgConfig):

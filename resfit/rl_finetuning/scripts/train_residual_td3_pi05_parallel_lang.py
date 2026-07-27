@@ -652,14 +652,17 @@ def collector_loop(
                     # print("cfg.algo.stddev_schedule:", cfg.algo.stddev_schedule)  # 0.003
                     stddev = utils.schedule(cfg.algo.stddev_schedule, global_step)
                     # print("stddev:", stddev)  # 0.0030000000000000005
+                    # Attach the base-action chunk (H*dim) so actor/critic see chunk-level base.
+                    obs["observation.base_action"] = base_policy.current_base_chunk(cfg.chunk_len)
                     obs_act = process_image_batch(copy.deepcopy(obs), image_keys, enc_type, rb=False)
-                    action = agent.act(obs_act, eval_mode=False, stddev=stddev, cpu=False)
+                    action = agent.act(obs_act, eval_mode=False, stddev=stddev, cpu=False)  # (1, H*dim)
 
                 if cfg.algo.progressive_clipping_steps > 0:
                     clip_factor = min(1.0, global_step / cfg.algo.progressive_clipping_steps)  # 训练一开始不要让 residual action 太大，而是慢慢放开
                     action = action * clip_factor  # 让 residual policy 在训练早期影响较小，避免一开始破坏 base policy
 
-                next_obs, reward, done, info = base_policy.step(residual_action=action)
+                # Open-loop execute the whole residual chunk; store ONE chunk macro-transition.
+                next_obs, combined_chunk, reward, done, info = base_policy.step_chunk(action.reshape(1, -1))
                 if done:
                     task_prompt = info["task_prompt"]
                     task_emb = lang_embedder(task_prompt)
@@ -678,7 +681,7 @@ def collector_loop(
                 step_payload = {
                     "obs": obs,
                     "next_obs": next_obs,
-                    "action": info["scaled_action"],  # combined action
+                    "action": combined_chunk,  # combined action chunk (1, H*dim)
                     "reward": reward,
                     "done": done,
                     "info": info,
@@ -713,6 +716,7 @@ def collector_loop(
                         output_dir=outputs_dir,
                         lang_cfg = lang_cfg,
                         lang_embedder= lang_embedder,
+                        chunk_len=cfg.chunk_len,
                     )
 
                     # Handle model saving when success rate improves
@@ -728,7 +732,8 @@ def collector_loop(
             # 原来 eval 后会 reset，这里 episode 结束也 reset
             # obs = base_policy.reset()
             
-            global_step += cfg.send_transitions_len
+            # Each collected transition spans one chunk = chunk_len env steps.
+            global_step += cfg.send_transitions_len * cfg.chunk_len
         stop_event.set()
         print("[collector] finished")
 
@@ -1099,7 +1104,14 @@ def main(cfg: ResidualTD3DexmgConfig):
     lowdim_dim = 8  # 8+8
     # img_c, img_h, img_w =3, 224, 224
     img_c, img_h, img_w =3, 84, 84
-    action_dim = 8
+    per_step_dim = 8
+    chunk_len = cfg.chunk_len
+    action_dim = per_step_dim * chunk_len  # actor/critic act_dim = chunk_len * per_step_dim
+    # n-step is accumulated OVER CHUNKS, so bootstrap discount is gamma**H.
+    gamma_chunk = cfg.algo.gamma ** chunk_len
+    # Buffer/learning_starts counters are in STEP units; convert to chunk counts.
+    online_buffer_size_chunks = max(1, cfg.algo.buffer_size // chunk_len)
+    learning_starts_chunks = max(1, cfg.algo.learning_starts // chunk_len)
     lowdim_keys = ["observation.state", "observation.base_action"]
 
     # ---------------------------------------------------------------------
@@ -1166,12 +1178,14 @@ def main(cfg: ResidualTD3DexmgConfig):
 
     # Use TensorDictPrioritizedReplayBuffer with optimized prefetching
     online_rb = TensorDictPrioritizedReplayBuffer(
-        storage=LazyTensorStorage(max_size=cfg.algo.buffer_size, device="cpu"),
+        storage=LazyTensorStorage(max_size=online_buffer_size_chunks, device="cpu"),
         alpha=alpha,
         beta=beta,
         eps=1e-6,  # Small epsilon added to priorities to prevent zero values
         priority_key="_priority",
-        transform=MultiStepTransform(n_steps=cfg.algo.n_step, gamma=cfg.algo.gamma),
+        # One buffer entry = one chunk macro-transition; n-step is accumulated over
+        # chunks with gamma_chunk = gamma**chunk_len.
+        transform=MultiStepTransform(n_steps=cfg.algo.n_step, gamma=gamma_chunk),
         pin_memory=True,
         prefetch=cfg.algo.prefetch_batches,  # Add prefetching
         batch_size=online_batch_size,
@@ -1185,6 +1199,9 @@ def main(cfg: ResidualTD3DexmgConfig):
         "image_keys": image_keys,
         "n_step": cfg.algo.n_step,
         "gamma": cfg.algo.gamma,
+        "chunk_len": chunk_len,
+        "gamma_chunk": gamma_chunk,
+        "storage": "chunk_v1",  # chunk macro-transition format; never mix with per-step caches
         "horizon": horizon,
         "size": cfg.algo.learning_starts,
         "sampling_strategy": cfg.algo.sampling_strategy,
@@ -1267,7 +1284,8 @@ def main(cfg: ResidualTD3DexmgConfig):
         beta=beta,
         eps=1e-6,  # Small epsilon added to priorities to prevent zero values
         priority_key="_priority",
-        transform=MultiStepTransform(n_steps=cfg.algo.n_step, gamma=cfg.algo.gamma),
+        # Same MultiStep-over-chunks framework as the online buffer.
+        transform=MultiStepTransform(n_steps=cfg.algo.n_step, gamma=gamma_chunk),
         pin_memory=True,
         prefetch=cfg.algo.prefetch_batches,  # Add prefetching
         batch_size=max(offline_batch_size, 1),  # Ensure batch_size is at least 1
@@ -1305,73 +1323,67 @@ def main(cfg: ResidualTD3DexmgConfig):
         if use_base_policy_for_base_actions and base_policy is None:
             raise ValueError("base_policy must be provided when use_base_policy_for_base_actions=True")
 
-        # Populate buffer from pre-loaded dataset
-        print("Populating offline buffer from dataset...")
+        # Populate buffer with CHUNK macro-transitions (same format as online chunks):
+        #   obs_t     = state_t, base_chunk = base_action[t : t+H]
+        #   action    = GT action chunk[t : t+H]
+        #   next_obs  = state_{t+H}, base_chunk[t+H : t+2H]
+        #   reward    = Σ_{h<n} gamma^h r_{t+h}   (n = steps until first done / H)
+        #   done      = a terminal fell inside [t, t+H)
+        # Chunks are STRIDE-H (non-overlapping) so MultiStepTransform (gamma_chunk)
+        # accumulates the n-step over-chunks return without double counting.
+        H = chunk_len
+        print("Populating offline buffer from dataset (chunk transitions)...")
         loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)   # todo define the offline data :  dataset
 
-        episode_cache: dict[int, dict] = {}
-        transitions = 0
-        step_id = 0
-
+        # 1) One per-frame pass -> per-episode frame records (kept on CPU).
+        episodes: dict[int, list[dict]] = defaultdict(list)
         for sample in tqdm(loader, desc="Processing offline dataset"):  # 用进度条逐样本处理
             ep_idx = int(sample["episode_index"].item())
-            if num_episodes is not None and ep_idx == num_episodes:
+            if num_episodes is not None and ep_idx >= num_episodes:
                 break
 
-            # ------------------------------------------------------------------
-            # Build observation and action directly for replay buffer ----------
-            # ------------------------------------------------------------------
-            # Extract data and keep on CPU (replay buffer uses CPU storage)
-            # _gt_action: torch.Tensor = sample["action"].float().squeeze(0)
             _gt_action: torch.Tensor = sample["eef_actions"].float().squeeze(0)
-            gt_action_scaled = action_scaler.scale(_gt_action)
-            # done_flag = bool(sample["next.done"].item())
+            gt_action_scaled = action_scaler.scale(_gt_action).reshape(-1).cpu()
             if "next.done" in sample:  # todo!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
                 done_flag = bool(sample["next.done"].item())
             elif "done" in sample:
                 done_flag = bool(sample["done"].item())
             else:
                 done_flag = False
-            
-            if done_flag:
-                print(f"episode done at {step_id}")
 
-            # Generate base action based on the selected mode
+            # Per-frame base action for the selected mode.
             if use_base_policy_for_base_actions:
-                # Use base policy to generate base action from current observation
-                # Build raw observation first for base policy inference
                 raw_obs = {}
                 for k in sample:
                     if "exterior_image_1_left" in k or "wrist_image_left" in k or "exterior_image_2_left" in k or "eef_position" in k or "gripper_position" in k:
                         raw_obs[k] = sample[k].to(device)  # Keep batch dimension for base policy
-
-                # Get base action from base policy
                 with torch.no_grad():
-                    # base_action = base_policy.select_action(raw_obs)
-                    # _, base_action, _, _, _ = base_policy.get_obs_and_base_action(raw_obs=raw_obs)  # todo done
                     task_index = int(sample["task_index"].item())
                     task_prompt = dataset_task_prompts[task_index]
-                    base_action = base_policy.get_offline_action_base(raw_obs, task_prompt)  # base_action shape:(8,)
+                    base_action = base_policy.get_offline_action_base(raw_obs, task_prompt)  # (8,)
                 base_action = torch.as_tensor(base_action, dtype=torch.float32)
-                base_action_scaled = action_scaler.scale(base_action.cpu())
+                base_action_scaled = action_scaler.scale(base_action.cpu()).reshape(-1)
             else:
-                # Use GT action as base action (original behavior)
-                base_action_scaled = gt_action_scaled
+                # Use GT action as base action (residual target 0)
+                base_action_scaled = gt_action_scaled.clone()
 
-            # Build observation dict directly in target format'
-            state = torch.cat((sample["eef_position"],sample["gripper_position"].unsqueeze(-1)),dim = -1)
-            curr_obs = {
-                "observation.state": state_standardizer.standardize(state.float().squeeze(0)),  # todo 
-                "observation.base_action": base_action_scaled,
+            state = torch.cat((sample["eef_position"], sample["gripper_position"].unsqueeze(-1)), dim=-1)
+            frame = {
+                "state": state_standardizer.standardize(state.float().squeeze(0)).cpu(),
+                "base": base_action_scaled,          # (m,)
+                "gt": gt_action_scaled,              # (m,)
+                "reward": float(done_flag),         # sparse terminal reward
+                "done": done_flag,
             }
+            img = {}
             for k in image_keys:
                 raw_k = k.replace("observation.images.", "")
-                curr_obs[k] = sample[raw_k].squeeze(0)
-            curr_obs = process_image_batch(curr_obs, image_keys, enc_type, rb=True)  ###
-            # Convert images to uint8 for memory-efficient storage
-            to_uint8(curr_obs, image_keys)
+                img[k] = sample[raw_k].squeeze(0)
+            img = process_image_batch(img, image_keys, enc_type, rb=True)  ###
+            to_uint8(img, image_keys)
+            for k in image_keys:
+                frame[k] = img[k]
 
-            # Inject task embedding from the dataset's per-frame task_index.
             if lang_cfg.enabled:
                 if lang_embedder is None:
                     raise RuntimeError("lang_embedder must be initialized when language is enabled")
@@ -1383,28 +1395,51 @@ def main(cfg: ResidualTD3DexmgConfig):
                         f"task_index={task_index} was not found in tasks.jsonl "
                         f"(available: {sorted(dataset_task_prompts)})"
                     )
-                task_prompt = dataset_task_prompts[task_index]
-                curr_task_emb = lang_embedder(task_prompt)
-                curr_obs[lang_cfg.lang_emb_obs_key] = curr_task_emb.detach().cpu()
+                frame[lang_cfg.lang_emb_obs_key] = lang_embedder(dataset_task_prompts[task_index]).detach().cpu()
 
-            # ------------------------------------------------------------------
-            # If we already cached the *previous* frame for this episode we can
-            # create transitions now.
-            # ------------------------------------------------------------------
-            if ep_idx in episode_cache:
-                # Create transitions for each combination of prev and current variants
-                prev_obs = episode_cache[ep_idx]["obs"]
-                # prev_obs = process_image_batch(prev_obs, image_keys, enc_type, rb=True)  ###
-                prev_action_scaled = episode_cache[ep_idx]["action"]
+            episodes[ep_idx].append(frame)
+
+        # 2) Assemble non-overlapping (stride-H) chunk transitions per episode.
+        transitions = 0
+        for _ep, frames in episodes.items():
+            T = len(frames)
+            for t in range(0, T - 1, H):
+                # executed steps in this chunk: up to H, stop right after first terminal
+                n, term = 0, False
+                while n < H and (t + n) < T:
+                    is_done = frames[t + n]["done"]
+                    n += 1
+                    if is_done:
+                        term = True
+                        break
+                last_valid = t + n - 1
+                idxs = [min(t + h, last_valid) for h in range(H)]
+                nt = min(t + H, T - 1)
+                nidxs = [min(nt + h, T - 1) for h in range(H)]
+
+                base_chunk = torch.stack([frames[i]["base"] for i in idxs], dim=0).reshape(-1)     # (H*m,)
+                action_chunk = torch.stack([frames[i]["gt"] for i in idxs], dim=0).reshape(-1)     # (H*m,)
+                next_base_chunk = torch.stack([frames[i]["base"] for i in nidxs], dim=0).reshape(-1)
+                R = sum((cfg.algo.gamma ** h) * frames[t + h]["reward"] for h in range(n))
+
+                cur_obs = {"observation.state": frames[t]["state"], "observation.base_action": base_chunk}
+                next_obs = {"observation.state": frames[nt]["state"], "observation.base_action": next_base_chunk}
+                for k in image_keys:
+                    cur_obs[k] = frames[t][k]
+                    next_obs[k] = frames[nt][k]
+                if lang_cfg.enabled:
+                    cur_obs[lang_cfg.lang_emb_obs_key] = frames[t][lang_cfg.lang_emb_obs_key]
+                    next_obs[lang_cfg.lang_emb_obs_key] = frames[nt][lang_cfg.lang_emb_obs_key]
+
                 transition = TensorDict(
                     {
-                        "obs": TensorDict(prev_obs, batch_size=[]),
-                        "action": prev_action_scaled,
+                        "obs": TensorDict(cur_obs, batch_size=[]),
+                        "action": action_chunk,
                         "next": TensorDict(
                             {
-                                "obs": TensorDict(curr_obs, batch_size=[]),
-                                "done": torch.tensor(done_flag, dtype=torch.bool),
-                                "reward": torch.tensor(float(done_flag), dtype=torch.float32),
+                                "obs": TensorDict(next_obs, batch_size=[]),
+                                "done": torch.tensor(bool(term), dtype=torch.bool),
+                                "reward": torch.tensor(float(R), dtype=torch.float32),
                             },
                             batch_size=[],
                         ),
@@ -1416,20 +1451,8 @@ def main(cfg: ResidualTD3DexmgConfig):
                 rb.add(transition)
                 transitions += 1
 
-                step_id += 1
-            else:
-                step_id = 0
-
-            # Cache current frame for pairing with the next one ---------------
-            episode_cache[ep_idx] = {
-                "obs": curr_obs,
-                "action": gt_action_scaled,
-                "done": done_flag,
-                "step_id": step_id,
-            }
-
         # Log final statistics
-        print(f"Added {transitions} transitions")
+        print(f"Added {transitions} offline chunk transitions")
 
         return transitions
 
@@ -1447,6 +1470,9 @@ def main(cfg: ResidualTD3DexmgConfig):
         "image_keys": image_keys,
         "n_step": cfg.algo.n_step,
         "gamma": cfg.algo.gamma,
+        "chunk_len": chunk_len,
+        "gamma_chunk": gamma_chunk,
+        "storage": "chunk_v1",  # chunk macro-transition format; never mix with per-step caches
         "base_policy_wandb_id": cfg.base_policy.wandb_id,
         "sampling_strategy": cfg.algo.sampling_strategy,
         "normalized_actions": True,
@@ -1518,8 +1544,9 @@ def main(cfg: ResidualTD3DexmgConfig):
     # Warm-up phase (random policy) --------------------------------------
     # ------------------------------------------------------------------
 
-    if len(online_rb) < cfg.algo.learning_starts and not loaded_online_from_cache and not getattr(cfg, "resume", False):
-        print(f"Warm-up: filling online buffer with {cfg.algo.learning_starts - len(online_rb)} random steps…")
+    if len(online_rb) < learning_starts_chunks and not loaded_online_from_cache and not getattr(cfg, "resume", False):
+        print(f"Warm-up: filling online buffer with {learning_starts_chunks - len(online_rb)} random chunks "
+              f"({(learning_starts_chunks - len(online_rb)) * chunk_len} steps)…")
         # obs, _ = env.reset()
         # obs = base_policy.reset() # todo reset
         # task_one = "pick up the cube and place it into the bowl"
@@ -1537,33 +1564,28 @@ def main(cfg: ResidualTD3DexmgConfig):
         reward_sum = 0
         episode_count = 0
 
-        while len(online_rb) < cfg.algo.learning_starts:
+        while len(online_rb) < learning_starts_chunks:
             print(f"[warmup] len(online_rb) before step = {len(online_rb)}")
+            # Attach the base-action chunk (H*dim) so the stored obs is chunk-level.
+            obs["observation.base_action"] = base_policy.current_base_chunk(chunk_len)
             if cfg.algo.use_base_policy_for_warmup:
-                # Use base policy action + noise (residual exploration)
-                # Since the environment wrapper always adds base_action to residual_action,
-                # we just need to provide the noise as the residual action
+                # Use base policy action + noise (residual exploration). The chunk client
+                # adds the per-step base action, so the residual chunk is just the noise.
                 rand_actions = (  # line2: Sample noise εt ∼ U (−noise scale, noise scale)
                     torch.rand((cfg.num_envs, action_dim), device=device) * 2 - 1
                 ) * cfg.algo.random_action_noise_scale
             else:
-                # Pure uniform random actions - need to cancel out the base policy action
-                # Since env does: combined = base_action + residual_action
-                # To get pure random: residual_action = random - base_action
-                # base_action = obs["observation.base_action"]  # Already normalized to [-1, 1]
-                base_action = base_policy._last_base_action # todo need to normailize  ************may need to reset??
+                # Pure uniform random chunk - cancel out the base action chunk.
+                # Since env does: combined = base_chunk + residual_chunk
+                base_chunk = base_policy.current_base_chunk(chunk_len)  # (1, H*dim), scaled
 
                 pure_random = (
                     torch.rand((cfg.num_envs, action_dim), device=device) * 2 - 1
                 ) * cfg.algo.random_action_noise_scale
-                rand_actions = pure_random - base_action
+                rand_actions = pure_random - base_chunk
 
-            # line4: Observe next state st+1, reward rt, done flag dt
-            # next_obs, reward, terminated, truncated, info = env.step(rand_actions)  # line3: Step env with at = εt + atb where atb ∼ πb(st)
-
-            # next_obs, base_action, reward, terminated, truncated, info = base_policy.step(residual_action=rand_actions) # todo need to return  reward, terminated, truncated, info  normalize 
-            # done = terminated | truncated
-            next_obs, reward, done, info = base_policy.step(residual_action=rand_actions ) # todo need to return  reward, terminated, truncated, info  normalize 
+            # line3-4: open-loop execute the residual chunk; observe next chunk-start obs
+            next_obs, combined_action, reward, done, info = base_policy.step_chunk(rand_actions)
             # print(f"[warmup] after step: reward={reward}, done={done}")
             task_prompt = info["task_prompt"]
             task_emb = lang_embedder(task_prompt)
@@ -1578,8 +1600,7 @@ def main(cfg: ResidualTD3DexmgConfig):
                 else:
                     res = "✗"
                 print(f"task: {task_prompt} : {res}")
-            # Use the executed combined action returned by the environment
-            combined_action = info["scaled_action"]
+            # combined_action is the executed combined action chunk (1, H*dim)
             _add_transitions_to_buffer(  # line5: Add transition (st, atb, at, st+1, atb+1, rt, dt) to online replay buffer
                 obs=obs,
                 next_obs=next_obs,
@@ -1602,8 +1623,8 @@ def main(cfg: ResidualTD3DexmgConfig):
             if len(online_rb) >= next_log_threshold:  # todo
                 success_rate = reward_sum / episode_count if episode_count > 0 else 0.0
                 print(
-                    f"[Warm-up] {len(online_rb)} / {cfg.algo.learning_starts} "
-                    f"transitions collected, reward_sum={reward_sum:.2f}, "
+                    f"[Warm-up] {len(online_rb)} / {learning_starts_chunks} "
+                    f"chunks collected ({len(online_rb) * chunk_len} steps), reward_sum={reward_sum:.2f}, "
                     f"success_rate={success_rate:.3f} ({reward_sum}/{episode_count})"
                 )
                 next_log_threshold += 1000

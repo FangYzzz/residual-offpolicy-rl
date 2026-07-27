@@ -384,6 +384,64 @@ class BasePolicy:
 
         return next_obs, reward, done, info
 
+    def current_base_chunk(self, chunk_len):
+        """Flat SCALED base-action chunk (1, chunk_len*dim) at the current step.
+
+        ``_last_base_action`` is already scaled; ``base_action_buffer`` holds the raw
+        upcoming steps of the current base plan (scaled here). Pads by repeating the
+        last valid entry when the base plan runs out.
+        """
+        first = torch.as_tensor(self._last_base_action, dtype=torch.float32, device=self.device).reshape(-1)
+        parts = [first]
+        for j in range(chunk_len - 1):
+            if j < len(self.base_action_buffer):
+                raw = torch.as_tensor(self.base_action_buffer[j], dtype=torch.float32, device=self.device)
+                parts.append(self.action_scaler.scale(raw).reshape(-1))
+            else:
+                parts.append(parts[-1].clone())
+        return torch.cat(parts, dim=-1).unsqueeze(0)
+
+    def step_chunk(self, residual_flat, task_prompt=None, evaluation=False):
+        """Open-loop execute one residual chunk.
+
+        ``residual_flat``: (1, chunk_len*dim). ``step`` already adds its own per-step
+        base action, so we only feed the residual slice each step. Returns the next
+        chunk-start obs, the executed combined action chunk (1, chunk_len*dim), the
+        accumulated (undiscounted) reward, done, and info. Reward is left undiscounted
+        because rewards are sparse/terminal (0/1) and eval checks ``reward > 0.9``;
+        cross-chunk discounting is handled by ``gamma_chunk = gamma**H`` in the buffer.
+        """
+        per_step_dim = torch.as_tensor(self._last_base_action).reshape(-1).shape[0]
+        residual = residual_flat.reshape(-1, per_step_dim)  # (H, m)
+        H = residual.shape[0]
+        combined_parts = []
+        reward_sum = 0.0
+        done = False
+        info = {}
+        next_obs = None
+        for h in range(H):
+            next_obs, r, d, info = self.step(
+                residual_action=residual[h : h + 1], task_prompt=task_prompt, evaluation=evaluation
+            )
+            combined_parts.append(info["scaled_action"].reshape(-1))  # (m,) scaled
+            reward_sum += float(r.sum().item())
+            if bool(d.any()):
+                done = True
+                break
+        while len(combined_parts) < H:  # pad on early termination
+            combined_parts.append(combined_parts[-1].clone())
+        combined = torch.stack(combined_parts, dim=0)  # (H, m) scaled
+        combined_flat = combined.reshape(1, -1)  # (1, H*m) -> buffer action
+        reward = torch.as_tensor([reward_sum], dtype=torch.float32, device=self.device)
+        done_t = torch.as_tensor([done], dtype=torch.bool, device=self.device)
+        out_info = {
+            "scaled_action": combined_flat,  # chunk-level combined action (for buffer)
+            "combined_action": self.action_scaler.unscale(combined),  # (H, m) unscaled (for eval plots)
+            "residual_action": residual,  # (H, m)
+            "task_prompt": self.text,
+        }
+        return next_obs, combined_flat, reward, done_t, out_info
+
     def get_transition(self, combined_action, query_action_base, task_prompt):
         # 转成 numpy，并去掉 batch 维
         if isinstance(combined_action, torch.Tensor):

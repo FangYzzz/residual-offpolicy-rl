@@ -284,7 +284,8 @@ def run_franka_evaluation(
     run_name: str | None = None,
     output_dir: str | Path | None = "outputs",
     lang_cfg,
-    lang_embedder
+    lang_embedder,
+    chunk_len: int = 1,
 ) -> tuple[dict[str, float], float]:
     device = torch.device(device)
     agent.eval()
@@ -338,6 +339,8 @@ def run_franka_evaluation(
         with torch.no_grad():
             obs = process_image_batch_dim(obs, image_keys, out_size=84)
             # obs = _attach_task_emb(obs,lang_cfg, task_emb)
+            # Attach the base-action chunk (H*dim) so actor/critic see chunk-level base.
+            obs["observation.base_action"] = env.current_base_chunk(chunk_len)
             actions = q_actions = agent.act(obs, eval_mode=True, stddev=0.0, cpu=False)
 
             obs_q = agent._augment_state(obs, detach_lang=True)
@@ -357,7 +360,10 @@ def run_franka_evaluation(
         # -----------------------------------------------------------
         # 2. Env step
         # -----------------------------------------------------------
-        next_obs, reward, done, info = env.step(actions, task_prompt=task_prompt, evaluation = True)
+        # Open-loop execute the whole predicted residual chunk.
+        next_obs, combined_chunk, reward, done, info = env.step_chunk(
+            actions, task_prompt=task_prompt, evaluation=True
+        )
 
         combined_action = info["combined_action"]
         residual_action = info["residual_action"]
