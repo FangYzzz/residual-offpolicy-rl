@@ -163,6 +163,16 @@ class QAgentConfig:
     # TD3 target action noise configuration
     target_action_noise: bool = True  # Whether to add noise to target actions in TD3
 
+    # ---- Hard Q-advantage residual gate ----
+    # When enabled, the residual (combined action) is only adopted where the critic
+    # judges it a real improvement over the base action, i.e.
+    # Q(s, a_base + residual) - Q(s, a_base) > gate_threshold; otherwise the base
+    # action is executed (residual -> 0). Applied both when acting and in the critic
+    # target's next-action selection. Default off (existing behavior).
+    gate_mode: str = "off"  # "off" or "hard"
+    use_residual_gate: bool = False  # alternative switch; "hard" gate_mode also enables it
+    gate_threshold: float = 0.0  # Q-advantage threshold for adopting the residual
+
     def __post_init__(self):
         pass
 

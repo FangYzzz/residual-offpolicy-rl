@@ -65,6 +65,18 @@ class QAgentLang(nn.Module):
         self.cfg = cfg
         self.residual_actor = residual_actor
 
+        # ---- Hard Q-advantage residual gate ----
+        # Adopt the combined (base + residual) action only where the critic judges it a
+        # clear improvement over the base action; otherwise fall back to the base action
+        # (residual -> 0). Applied in act() and in the critic target's next-action.
+        _gate_mode = str(getattr(cfg, "gate_mode", "off"))
+        self.use_residual_gate = bool(getattr(cfg, "use_residual_gate", False)) or (_gate_mode == "hard")
+        self.residual_gate_threshold = float(getattr(cfg, "gate_threshold", 0.0))
+        # Most-recent gate adoption rate (logged), split by phase.
+        self.last_rollout_gate_adopt_rate = None
+        self.last_eval_gate_adopt_rate = None
+        self._last_gate_adv = None
+
         self.lang_cfg = cfg.language
         self.lang_enabled: bool = bool(self.lang_cfg.enabled)
         self._raw_prop_dim: int = int(prop_shape[0])
@@ -329,6 +341,24 @@ class QAgentLang(nn.Module):
                 obs[k] = v.unsqueeze(0)
         return should_unsqueeze
 
+    @torch.no_grad()
+    def _gate_adopt_mask(self, feat, prop, base_action, combined, *, use_target: bool = False):
+        """Return ``(adopt, adv)`` where ``adopt`` is a (B, 1) bool mask that is True
+        where the combined action is adopted, i.e. the critic's advantage
+        ``Q(comb) - Q(base) > residual_gate_threshold``.
+
+        Uses the ensemble-mean Q (same deterministic estimator for base and comb) so
+        the comparison is consistent.
+        """
+        critic = self.critic_target if use_target else self.critic
+        q_base = critic(feat, prop, base_action).mean(dim=0).reshape(-1)  # (B,)
+        q_comb = critic(feat, prop, combined).mean(dim=0).reshape(-1)     # (B,)
+        adv = q_comb - q_base                                            # (B,)
+        adopt = adv > self.residual_gate_threshold                       # (B,)
+        if not use_target:  # acting path -> stash for eval logging
+            self._last_gate_adv = adv.detach()
+        return adopt.view(-1, 1), adv
+
     def act(self, obs: dict[str, torch.Tensor], *, eval_mode=False, stddev=0.0, cpu=True) -> torch.Tensor:
         """This function takes tensor and returns actions in tensor"""
         assert not self.training
@@ -351,6 +381,21 @@ class QAgentLang(nn.Module):
             clip=1,  # clip
             use_target=False,
         )
+
+        # Hard Q-advantage gate: keep the base action (residual -> 0) unless the
+        # combined action is a clear improvement over the base action.
+        if self.use_residual_gate and self.residual_actor:
+            base_action = obs["observation.base_action"]
+            combined = torch.clamp(base_action + action, -1.0, 1.0)
+            adopt, _adv = self._gate_adopt_mask(
+                obs["feat"], obs["observation.state"], base_action, combined, use_target=False
+            )
+            adopt_rate = adopt.float().mean().item()
+            if eval_mode:
+                self.last_eval_gate_adopt_rate = adopt_rate
+            else:
+                self.last_rollout_gate_adopt_rate = adopt_rate
+            action = action * adopt.to(action.dtype)
 
         if unsqueezed:
             action = action.squeeze(0)
@@ -425,7 +470,17 @@ class QAgentLang(nn.Module):
             if self.residual_actor:
                 # Current step: 'action' from the replay buffer is the executed combined action
                 # Next step: combine and clamp to match environment execution
-                next_action = torch.clamp(next_obs["observation.base_action"] + next_residual_action, -1.0, 1.0)
+                next_base_action = next_obs["observation.base_action"]
+                next_action = torch.clamp(next_base_action + next_residual_action, -1.0, 1.0)
+                # Gate the bootstrap action consistently with acting: fall back to the
+                # base action where the combined one is not a clear improvement.
+                if self.use_residual_gate:
+                    adopt, _adv = self._gate_adopt_mask(
+                        next_obs["feat"], next_obs["observation.state"],
+                        next_base_action, next_action, use_target=True,
+                    )
+                    next_action = torch.where(adopt, next_action, next_base_action)
+                    self._gate_adopt_rate = adopt.float().mean().item()
             else:
                 next_action = next_residual_action
 
@@ -491,6 +546,8 @@ class QAgentLang(nn.Module):
         metrics = {}
         metrics["train/critic_qt"] = target_q.mean().item()
         metrics["train/critic_loss"] = critic_loss.item()
+        if self.use_residual_gate and getattr(self, "_gate_adopt_rate", None) is not None:
+            metrics["train/gate_adopt_rate"] = self._gate_adopt_rate
         # Store target_q for potential logging (calculated only when needed)
         metrics["_target_q"] = target_q.detach().cpu()
         # Store TD errors for prioritized experience replay

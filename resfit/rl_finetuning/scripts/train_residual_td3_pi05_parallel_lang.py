@@ -670,12 +670,11 @@ def collector_loop(
                 if done.any():
                     episode_count += done.float().sum().item()
                     episode_done = True
-                    wandb.log(
-                        {
-                            "training/reward": reward
-                        },
-                        step= global_step,
-                    )
+                    # Reward is sparse/terminal -> only log it at episode end.
+                    _log = {"training/reward": float(reward.sum().item())}
+                    if getattr(agent, "last_rollout_gate_adopt_rate", None) is not None:
+                        _log["rollout/gate_adopt_rate"] = agent.last_rollout_gate_adopt_rate
+                    wandb.log(_log, step=global_step)
 
                 # 注意：这里先不 add_to_buffer，而是存起来（仍然是一步）
                 step_payload = {
