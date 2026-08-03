@@ -80,11 +80,14 @@ def to_hwc(img):
     return img
 
 def process_policy_images(obs_left, obs_right, obs_wrist):
-    obs_left = prepare_image_256(to_hwc(obs_left))
+    if obs_left is not None:
+        obs_left = prepare_image_256(to_hwc(obs_left))
     obs_right = prepare_image_256(to_hwc(obs_right))
     obs_wrist = prepare_image_256(to_hwc(obs_wrist))  # padding
 
-    left_resized = image_tools.resize_with_pad(obs_left, 224, 224)
+    left_resized = None
+    if obs_left is not None:
+        left_resized = image_tools.resize_with_pad(obs_left, 224, 224)
     right_resized = image_tools.resize_with_pad(obs_right, 224, 224)
     wrist_resized = image_tools.resize_with_pad(obs_wrist, 224, 224)
 

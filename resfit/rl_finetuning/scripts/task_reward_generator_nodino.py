@@ -2,7 +2,6 @@ import os
 import sys
 
 import cv2
-import torch
 import time, threading, queue, random
 import subprocess
 from queue import Queue
@@ -14,7 +13,6 @@ import pyzed.sl as sl
 import base64
 from dotenv import load_dotenv
 from openai import OpenAI
-from groundingdino.util.inference import Model, annotate
 from loguru import logger
 
 import uvicorn
@@ -39,8 +37,8 @@ class TaskRewardGenerator:
     ):
         # Configuration
         self.max_timesteps = max_timesteps
-        self.current_scene_gdino = None
-        self.next_scene_gdino = None
+        self.current_scene = None
+        self.next_scene = None
 
         # camera
         self.zed = None
@@ -59,13 +57,7 @@ class TaskRewardGenerator:
         self.pool = ThreadPoolExecutor(max_workers=2)
         self.queue: "Queue[tuple[list[str], list[str]]]" = Queue()
 
-        # Hardware / model setup
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model = Model(
-            model_config_path="/home/yuan/self_vla/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py",
-            model_checkpoint_path="/home/yuan/self_vla/GroundingDINO/weights/groundingdino_swint_ogc.pth",
-            device=self.device,
-        )
+        # No GroundingDINO model is loaded in this variant.
         self.runtime_parameters = None
 
         # OpenAI client
@@ -78,7 +70,6 @@ class TaskRewardGenerator:
         self.scene_before = None
         self.scene_after = None
         self.selected_task = None
-        self.selected_objects = None
         self.img_rgb = None
 
         self.candidate_tasks = [
@@ -109,9 +100,10 @@ class TaskRewardGenerator:
         # Relative generation probabilities. Infeasible tasks are removed first,
         # then these weights are normalized over the remaining feasible tasks.
         self.task_probabilities = {
-            "Put a cube into the bowl": 0.33,
-            "Take the cube out of the bowl": 0.33,
-            "Stack one cube on the other cube": 0.34,
+            "Put a cube into the bowl": 0.25,
+            "Take the cube out of the bowl": 0.25,
+            "Stack one cube on the other cube": 0.25,
+            "Take the top cube off the other cube": 0.25,
         }
 
     def setup_logger(self):
@@ -159,6 +151,7 @@ class TaskRewardGenerator:
     #     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
     #     h, s, v = cv2.split(hsv)
 
+        # Configuration
     #     # 初步找白色/灰白色物体区域
     #     candidate_mask = ((v > 130) & (s < 80)).astype(np.uint8) * 255
 
@@ -380,197 +373,55 @@ class TaskRewardGenerator:
     
     def process_img(self, img_rgb):
         img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
-        # ok, buffer = cv2.imencode(".jpg", img_bgr)
-
         img_bgr_low_exp = self.reduce_exposure_bgr(
             img_bgr,
             alpha=0.55,  # 0.6 # 0.8
             beta=0,      # 0   # -30
         )
-        ok, buffer = cv2.imencode(".jpg", img_bgr_low_exp)
-        
-        # # 1. 先增强 bowl，改善白色碗的结构
-        # img_bgr_processed = self.enhance_bowl_visibility_bgr(img_bgr)
-        # 2. 再增强 cube，提升颜色和边缘
-        img_bgr_processed = self.enhance_cube_visibility_bgr(img_bgr_low_exp)  # img_bgr_processed
-        ok, buffer = cv2.imencode(".jpg", img_bgr_processed)
+        img_bgr_processed = self.enhance_cube_visibility_bgr(img_bgr_low_exp)
+        masked_img_bgr = self.mask_image(img_bgr_processed)
 
-        # save_dir = f"output/task_reward_generation/{self.timestamp}"
-        # os.makedirs(save_dir, exist_ok=True)
-        # save_path = os.path.join(save_dir, f"scene_{round}.jpg")
-        # # cv2.imwrite(save_path, img_bgr)
-        # cv2.imwrite(save_path, img_rgb)
-        
+        # GPT and the saved before/after artifacts must use the same masked image.
+        ok, buffer = cv2.imencode(".jpg", masked_img_bgr)
         if ok:
             b64jpg = base64.b64encode(buffer.tobytes()).decode("utf-8")
         else:
-            raise RuntimeError("Failed to encode image to JPEG")
-        
-        # masked_img_rgb = self.mask_image(img_rgb)
-        # masked_img_bgr = self.mask_image(img_bgr_low_exp)
-        masked_img_bgr = self.mask_image(img_bgr_processed)
+            raise RuntimeError("Failed to encode masked image to JPEG")
 
-        # return masked_img_rgb, b64jpg
         return masked_img_bgr, b64jpg
 
     def encode_image(self, image_path):
         with open(image_path, "rb") as image_file:
             return base64.b64encode(image_file.read()).decode("utf-8")
 
-    def filter_gdino_detections(self, detections, image_shape, max_area_ratio=0.25):
-        """
-        去掉占图像面积太大的框，例如整张桌子的红色大框。
-        detections: GroundingDINO new API 输出，xyxy 绝对像素坐标
-        """
-        image_h, image_w = image_shape[:2]
-        image_area = image_h * image_w
-        boxes = detections.xyxy
-        area_ratios = (
-            (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
-        ) / image_area
-        keep = area_ratios < max_area_ratio
-
-        # Preserve the previous behavior: if every box is too large, retain all.
-        return detections[keep] if np.any(keep) else detections
-
-    def gdino(self, scene, before):
-        # if isinstance(self.selected_objects, str):
-        #     classes = [
-        #         class_name.strip()
-        #         for class_name in self.selected_objects.split(".")
-        #         if class_name.strip()
-        #     ]
-        # else:
-        #     classes = list(self.selected_objects)
-
-        classes = ["cube", "bowl", "mug", "mug tree", "drawer"]
-
-        BOX_THRESHOLD = 0.25 #0.33 # 0.30 # 0.35  
-        TEXT_THRESHOLD = 0.18 # 0.22 # 0.25
-
-        detections = self.model.predict_with_classes(
-            image=scene,
-            classes=classes,
-            box_threshold=BOX_THRESHOLD,
-            text_threshold=TEXT_THRESHOLD
-        )
-
-        detections = self.filter_gdino_detections(
-            detections,
-            scene.shape,
-            max_area_ratio=0.25,
-        )
-
-        # Keep using the existing annotation helper, which expects normalized
-        # cxcywh boxes and phrase labels rather than supervision.Detections.
-        image_h, image_w = scene.shape[:2]
-        boxes_xyxy = torch.as_tensor(detections.xyxy, dtype=torch.float32)
-        boxes = torch.empty_like(boxes_xyxy)
-        boxes[:, 0] = (boxes_xyxy[:, 0] + boxes_xyxy[:, 2]) / (2 * image_w)
-        boxes[:, 1] = (boxes_xyxy[:, 1] + boxes_xyxy[:, 3]) / (2 * image_h)
-        boxes[:, 2] = (boxes_xyxy[:, 2] - boxes_xyxy[:, 0]) / image_w
-        boxes[:, 3] = (boxes_xyxy[:, 3] - boxes_xyxy[:, 1]) / image_h
-        logits = torch.as_tensor(detections.confidence, dtype=torch.float32)
-        phrases = [
-            classes[class_id] if class_id is not None else "unknown"
-            for class_id in detections.class_id
-        ]
-        # scene is BGR for the new API; annotate expects an RGB source image.
-        image_source = cv2.cvtColor(scene, cv2.COLOR_BGR2RGB)
-        annotated_frame = annotate(
-            image_source=image_source,
-            boxes=boxes,
-            logits=logits,
-            phrases=phrases,
-        )
-
-        save_dir = self.output_dir
-        save_dir.mkdir(parents=True, exist_ok=True)
-        if before == True:
-            save_path = save_dir / f"annotated_image_{self.round}_0_before.jpg"
-        else:
-            save_path = save_dir / f"annotated_image_{self.round}_1_after.jpg"
-        cv2.imwrite(str(save_path), annotated_frame)
-
-        scene_gdino = self.encode_image(str(save_path))
-
-        return scene_gdino
+    def capture_scene(self, encoded_scene, before):
+        """Save and return a GPT-ready scene without object detection."""
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        suffix = "0_before" if before else "1_after"
+        save_path = self.output_dir / f"gpt_image_{self.round}_{suffix}.jpg"
+        save_path.write_bytes(base64.b64decode(encoded_scene))
+        return encoded_scene
 
     def task_generator(self, scene):
-        tasks_text = "\n".join([f"- {task}" for task in self.candidate_tasks])
         prompt_task = (
-            f"Task list:\n{tasks_text}\n\n"
-
-            "You are a one-arm robot. Based on the image, determine the current spatial "
-            "relationships and states of the objects.\n"
-            "The scene contains exactly two cubes, one bowl, one drawer, one mug, and one mug tree.\n\n"
-
-            "Evaluate EVERY task in the task list. Mark a task feasible only when its goal "
-            "state is not already satisfied and all task-specific preconditions are met.\n"
-            "Do not choose a task yourself; the caller will sample from the feasible tasks.\n"
-            "The following task-specific rules are hard constraints and must never be violated.\n\n"
-
-            "Task-specific eligibility rules:\n\n"
-
-            "1. Cube and bowl tasks\n"
-            "- 'Put a cube into the bowl' may be selected only when the bowl contains no cube.\n"
-            "- 'Take the cube out of the bowl' may be selected only when the bowl contains exactly one cube.\n"
-            "- The bowl may contain at most one cube. Never select a task that would place "
-            "a second cube into the bowl.\n\n"
-
-            "2. Cube stacking tasks\n"
-            "- 'Stack one cube on the other cube' may be selected only when the bowl contains no cube, "
-            "both cubes are outside the bowl, and the cubes are not already stacked.\n"
-            "- 'Take the top cube off the other cube' may be selected only when one cube is "
-            "currently stacked on top of the other cube.\n\n"
-
-            # "3. Drawer tasks\n"
-            # "- 'Open the drawer' may be selected only when the drawer is currently closed.\n"
-            # "- 'Close the drawer' may be selected only when the drawer is currently open.\n\n"
-
-            # "4. Mug and mug-tree tasks\n"
-            # "- 'Hang the mug on the mug tree' may be selected only when the mug is not "
-            # "currently hanging on the mug tree.\n"
-            # "- 'Take the mug off the mug tree' may be selected only when the mug is currently "
-            # "hanging on the mug tree.\n\n"
-
-            "Do not invent, rewrite, or modify any task from the task list.\n"
-            "Return only the required output, with no explanation or additional text.\n\n"
-
-            "Return exactly one valid JSON object in this format:\n"
-            "{\n"
-            "  \"tasks\": [\n"
-            "    {\"task\": \"<task copied verbatim from the task list>\", "
-            "\"feasible\": true, \"objects\": \"<object1> . <object2> .\"}\n"
-            "  ]\n"
-            "}\n"
-            "Include exactly one entry for every task in the task list. Use JSON booleans "
-            "true and false. For an infeasible task, objects may be an empty string.\n"
+            "Inspect the image and report only the current physical scene state.\n"
+            "The scene contains exactly two cubes and one bowl.\n"
+            "cube_count_in_bowl is the number of cubes currently inside or partially "
+            "inside the bowl; it must be 0 or 1.\n"
+            "cubes_stacked is true only when one cube is currently resting on top of "
+            "the other cube.\n"
+            "Do not evaluate tasks and do not return task names.\n"
+            "Return only one valid JSON object with exactly these fields:\n"
+            "{\"cube_count_in_bowl\": 0, \"cubes_stacked\": false}\n"
         )
 
-        # prompt_task = (
-        #     f"Task list:\n{tasks_text}\n\n"
-        #     "You are a one-arm robot. Based on the image, judge the spatial relationships between objects.\n"
-        #     "From the task list below, randomly choose ONE task that is feasible AND not already completed in the current scene.\n"
-        #     "A task is already completed if its desired final spatial relationship is already true in the image.\n"
-        #     "For example, if a cube is already inside the cube bowl, do NOT choose 'Put a cube into the bowl'.\n"
-        #     "Instead, you may choose 'Take the cube out of the bowl' if it is feasible.\n"
-        #     "Do not choose 'Stack one cube on the other cube' unless both cubes are outside the bowl.\n"
-        #     "Only choose a task whose goal state is currently false but can be achieved by the robot.\n"
-        #     "Do not invent, rewrite, or modify tasks.\n\n"
-            
-        #     "Return exactly in this format:\n"
-        #     "task: <selected task>\n"
-        #     "objects: <object1> . <object2> .\n"
-        # )
-
         response = self.client.responses.create(
-            model="gpt-4.1-mini", # gpt-4.1-mini
+            model="gpt-4.1-mini",
             input=[{
                 "role": "user",
                 "content": [
                     {"type": "input_text", "text": prompt_task},
-                    {"type": "input_image", "image_url": f"data:image/jpeg;base64,{scene}",},
+                    {"type": "input_image", "image_url": f"data:image/jpeg;base64,{scene}"},
                 ],
             }],
         )
@@ -579,50 +430,73 @@ class TaskRewardGenerator:
         json_start = output.find("{")
         json_end = output.rfind("}")
         if json_start == -1 or json_end == -1:
-            raise RuntimeError(f"Task feasibility response is not valid JSON: {output}")
+            raise RuntimeError(f"Scene-state response is not valid JSON: {output}")
 
         try:
             result = json.loads(output[json_start:json_end + 1])
         except json.JSONDecodeError as exc:
             raise RuntimeError(
-                f"Task feasibility response contains invalid JSON: {output}"
+                f"Scene-state response contains invalid JSON: {output}"
             ) from exc
-        if not isinstance(result, dict) or not isinstance(result.get("tasks"), list):
+        if not isinstance(result, dict):
+            raise RuntimeError(f"Scene-state response must be a JSON object: {output}")
+        expected_fields = {"cube_count_in_bowl", "cubes_stacked"}
+        if set(result) != expected_fields:
             raise RuntimeError(
-                f"Task feasibility JSON must contain a 'tasks' list: {output}"
+                f"Scene-state response must contain exactly {sorted(expected_fields)}: "
+                f"{output}"
             )
+
+        cube_count_in_bowl = result.get("cube_count_in_bowl")
+        cubes_stacked = result.get("cubes_stacked")
+        if type(cube_count_in_bowl) is not int or cube_count_in_bowl not in (0, 1):
+            raise RuntimeError(
+                f"cube_count_in_bowl must be integer 0 or 1: {output}"
+            )
+        if type(cubes_stacked) is not bool:
+            raise RuntimeError(f"cubes_stacked must be a JSON boolean: {output}")
+
         evaluations = {
-            item["task"]: item
-            for item in result.get("tasks", [])
-            if isinstance(item, dict) and item.get("task") in self.candidate_tasks
+            "Put a cube into the bowl": {
+                "feasible": cube_count_in_bowl == 0 and not cubes_stacked,
+            },
+            "Take the cube out of the bowl": {
+                "feasible": cube_count_in_bowl == 1 and not cubes_stacked,
+            },
+            "Stack one cube on the other cube": {
+                "feasible": cube_count_in_bowl == 0 and not cubes_stacked,
+            },
+            "Take the top cube off the other cube": {
+                "feasible": cube_count_in_bowl == 0 and cubes_stacked,
+            },
         }
         feasible_tasks = [
-            task for task in self.candidate_tasks
+            task
+            for task in self.candidate_tasks
             if evaluations.get(task, {}).get("feasible") is True
         ]
         if not feasible_tasks:
-            raise RuntimeError("No task satisfies the current scene constraints.")
+            raise RuntimeError(
+                "No candidate task is feasible for scene state "
+                f"cube_count_in_bowl={cube_count_in_bowl}, "
+                f"cubes_stacked={cubes_stacked}"
+            )
 
-        weights = [self.task_probabilities.get(task, 1.0) for task in feasible_tasks]
-        selected_task = random.choices(feasible_tasks, weights=weights, k=1)[0]
-        selected_objects = evaluations[selected_task].get("objects", "").strip()
-        if not selected_objects:
-            raise RuntimeError(f"No objects returned for selected task: {selected_task}")
-
-        self.selected_task = selected_task
-        self.selected_objects = selected_objects
+        weights = [
+            self.task_probabilities.get(task, 1.0)
+            for task in feasible_tasks
+        ]
+        self.selected_task = random.choices(
+            feasible_tasks, weights=weights, k=1
+        )[0]
+        logger.info(
+            "Scene state: "
+            f"cube_count_in_bowl={cube_count_in_bowl}, "
+            f"cubes_stacked={cubes_stacked}"
+        )
         logger.info(f"Feasible tasks: {feasible_tasks}; weights: {weights}")
 
-    def reward_generator(self, current_scene_gdino, next_scene_gdino, current_task):   
-        # image_path = "/home/yuan/self_vla/residual-offpolicy-rl/outputs/task_reward_generation/20260426_205142_/annotated_image_15.jpg"
-        # current_scene_gdino = self.encode_image(image_path)
-        # save_dir = f"/home/yuan/self_vla/residual-offpolicy-rl/outputs/task_reward_generation/initial_scene"
-        # os.makedirs(save_dir, exist_ok=True)
-        # save_path = os.path.join(save_dir, f"initial_scene_{self.round}.jpg")
-        # image_bytes = base64.b64decode(current_scene_gdino)
-        # with open(save_path, "wb") as f:
-        #     f.write(image_bytes)
-
+    def reward_generator(self, current_scene, next_scene, current_task):
         prompt_reward = (
             "You are given two images:\n"
             "- The **first image** shows the initial scene **before** the robot starts the task.\n"
@@ -639,9 +513,8 @@ class TaskRewardGenerator:
             "   - The right side of the image represents the **right side** of the object.\n"
             "2. Pay attention to whether the object is inside something like a bowl or container.\n"
             "3. Then carefully look at the **final position** of the key object in the second image.\n"
-            "4. **VERY IMPORTANT: If bounding boxes are visible, focus on the exact **box labels** — make sure you refer to the correct object name!**\n"
-            "   - Do NOT confuse objects with similar color/shape.\n"
-            "   - If labels clearly show containment or alignment, include that in your reasoning.\n"
+            "4. Carefully distinguish objects with similar colors or shapes using their "
+            "appearance and spatial context.\n"
             "5. Compare the final position with the task requirement. "
 
             "**Respond with only a single digit: `1` if the task was successfully completed, or `0` if it failed.**\n"
@@ -656,8 +529,8 @@ class TaskRewardGenerator:
                 "role": "user",
                 "content": [
                     {"type": "input_text", "text": prompt_reward},
-                    {"type": "input_image", "image_url": f"data:image/jpeg;base64,{current_scene_gdino}",},
-                    {"type": "input_image", "image_url": f"data:image/jpeg;base64,{next_scene_gdino}",},
+                    {"type": "input_image", "image_url": f"data:image/jpeg;base64,{current_scene}",},
+                    {"type": "input_image", "image_url": f"data:image/jpeg;base64,{next_scene}",},
                 ],
             }],
         )
@@ -669,34 +542,46 @@ class TaskRewardGenerator:
     # task_0-(reward_0-task_1)-(reward_1-task_2)-...
     def start_task(self, img_rgb):
         """Capture the before-scene for an externally supplied evaluation task."""
-        scene_dino, _ = self.process_img(img_rgb)
+        _, scene_gpt = self.process_img(img_rgb)
         self.round += 1
-        self.scene_before = self.gdino(scene_dino, before=True)
+        self.scene_before = self.capture_scene(scene_gpt, before=True)
 
     def task_generation(self, img_rgb):  # shape: (1080, 1920, 3) dtype: uint8
-        # if img_rgb is not None:  # round=0
-        #     scene_dino, scene_gpt = self.process_img(img_rgb)  # img_rgb
-        #     self.task_generator(scene_gpt, self.candidate_tasks)
-
-        #     self.scene_before = self.gdino(scene_dino, self.round)
-        # else:  # round=1,2,...
-        #     scene_dino, scene_gpt = self.process_img(self.img_rgb)  # self.img_rgb
-        #     self.task_generator(scene_gpt, self.candidate_tasks)
-
-        scene_dino, scene_gpt = self.process_img(img_rgb)
-        self.task_generator(scene_gpt)
+        _, scene_gpt = self.process_img(img_rgb)
+        last_error = None
+        for attempt in range(1, 4):
+            try:
+                self.task_generator(scene_gpt)
+                break
+            except RuntimeError as exc:
+                last_error = exc
+                logger.warning(
+                    f"Scene-state recognition attempt {attempt}/3 failed: {exc}"
+                )
+        else:
+            weights = [
+                self.task_probabilities.get(task, 1.0)
+                for task in self.candidate_tasks
+            ]
+            self.selected_task = random.choices(
+                self.candidate_tasks, weights=weights, k=1
+            )[0]
+            logger.error(
+                "GPT could not identify a valid scene state after 3 attempts; "
+                f"using probability-weighted fallback task "
+                f"'{self.selected_task}'. Last error: {last_error}"
+            )
         
         self.round += 1
-        self.scene_before = self.gdino(scene_dino, before=True)
+        self.scene_before = self.capture_scene(scene_gpt, before=True)
 
         logger.info(f"Selected task to execute: {self.selected_task}")
-        logger.info(f"Selected objects to detect: {self.selected_objects}")
         
         return self.selected_task, self.round
     
     def reward_generation(self, img_rgb, task_prompt = None):
-        next_scene_dino, next_scene_gpt = self.process_img(img_rgb)
-        self.scene_after = self.gdino(next_scene_dino, before=False)
+        _, next_scene_gpt = self.process_img(img_rgb)
+        self.scene_after = self.capture_scene(next_scene_gpt, before=False)
         if task_prompt ==None:
             task = self.selected_task
         else:

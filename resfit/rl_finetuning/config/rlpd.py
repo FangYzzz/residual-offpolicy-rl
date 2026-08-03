@@ -201,7 +201,7 @@ class RLPDAlgoConfig:
     update_every_n_steps: int = 1
 
     # Offline / online mixture ----------------------------------------------
-    offline_fraction: float = 0.6  # 0.5  # fraction of minibatch sampled from offline buffer
+    offline_fraction: float = 0.5  # 0.5  # fraction of minibatch sampled from offline buffer
 
     # ------------------------------------------------------------------
     # N-step returns ----------------------------------------------------
@@ -314,7 +314,7 @@ class RLPDDexmgConfig:
     task: str = "Can"
     num_envs: int = 1
     eval_num_envs: int = 8
-    eval_num_episodes: int = 20  # 50
+    eval_num_episodes: int = 2 #20  # 50
     headless: bool = True
     video_key: str = "observation.images.agentview"
     rl_camera: List[str] = field(

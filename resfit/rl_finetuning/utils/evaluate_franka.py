@@ -21,8 +21,6 @@ from resfit.rl_finetuning.off_policy.rl.q_agent_lang import QAgentLang
 from resfit.rl_finetuning.scripts.gpt_residual_robot import BasePolicy
 from loguru import logger
 import sys
-import os
-from datetime import datetime
 
 def process_image_batch_dim(obs_dict, image_keys, out_size=84):
     """
@@ -77,12 +75,13 @@ def _to_xyz_steps(arr) -> np.ndarray:
     else:
         return arr.reshape(-1)[None, :3]
 
-def setup_logger():
-        log_dir = f"outputs/task_reward_generation/{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        log_path = os.path.join(log_dir, "log.txt")
+def setup_logger(log_dir: str | Path):
+        log_dir = Path(log_dir)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / "log.txt"
 
         logger.remove()
-        logger.add(log_path, format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}", level="INFO")
+        logger.add(str(log_path), format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}", level="INFO")
         logger.add(sys.stdout, colorize=True, format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | {message}")
 
 # ----------------------------------------------------------------------
@@ -276,7 +275,7 @@ def run_franka_evaluation(
     *,
     env: BasePolicy,
     agent: QAgentLang,
-    num_episodes: int = 20,
+    eval_num_episode: int = 20,
     device: torch.device | str = "cuda",
     global_step: int | None = None,
     save_video: bool = False,
@@ -290,49 +289,64 @@ def run_franka_evaluation(
     device = torch.device(device)
     agent.eval()
     num_envs: int = env.num_envs if hasattr(env, "num_envs") else 1
-    setup_logger()
-    logger.info("-------------------------------eval--------------------------------")
-    successes_task_one: list[bool] = []
-    successes_task_two: list[bool] = []
+    eval_step = global_step or 0
+    cycle_dir = env.task_reward_generator.set_output_cycle(eval_step)
+    setup_logger(cycle_dir)
+    logger.info(f"---------------- evaluation after {eval_step} steps ----------------")
+    candidate_tasks = list(env.task_reward_generator.candidate_tasks)
+    if not candidate_tasks:
+        raise ValueError("env.task_reward_generator.candidate_tasks is empty")
+    logger.info(f"Evaluating each task for {eval_num_episode} episodes:")
+    for index, task in enumerate(candidate_tasks, start=1):
+        logger.info(f"task {index}: {task}")
+
+    successes_by_task: dict[str, list[bool]] = {
+        task: [] for task in candidate_tasks
+    }
     successes: list[bool] = []
-    switched = False
     # 每 episode 的缓冲
     ep_combined_buffers: list[list[np.ndarray]] = [[] for _ in range(num_envs)]
     ep_residual_buffers: list[list[np.ndarray]] = [[] for _ in range(num_envs)]
-    ep_q_preds_task_one: list[list[float]] = [[] for _ in range(num_envs)]
-    ep_q_preds_task_two: list[list[float]] = [[] for _ in range(num_envs)]
+    ep_q_preds: list[list[float]] = [[] for _ in range(num_envs)]
 
     # 已完成 episode 聚合
     all_combined_trajs: list[np.ndarray] = []
     all_residual_trajs: list[np.ndarray] = []
-    all_q_trajectories_task_one: list[list[float]] = []
-    all_q_trajectories_task_two: list[list[float]] = []
+    all_q_trajectories_by_task: dict[str, list[list[float]]] = {
+        task: [] for task in candidate_tasks
+    }
     # all_episode_lengths: list[int] = []
 
     frame_buffer: list[list[np.ndarray]] | None = [[] for _ in range(num_envs)] if save_video else None
 
     done_episodes = 0
-    # task_one = "pick up the cube and place it into the bowl"
-    # task_two = "pick up the cube from the bowl and place it outside the bowl"
-    task_one = "put the cube into the bowl"
-    task_two = "put the cube outside the bowl"
-    obs, task_prompt = env.reset()
-    task_prompt = task_one
+    total_episodes = eval_num_episode * len(candidate_tasks)
+    task_index = 0
+    task_prompt = candidate_tasks[task_index]
+    logger.info(f"---------------- task {task_index + 1}: {task_prompt} ----------------")
+    env.evaluation = True
+    obs = env.reset(task_prompt, evaluate_previous=False)
     task_emb = lang_embedder(task_prompt)
     obs = _attach_task_emb(obs,lang_cfg, task_emb)
 
-    progress_dots = ["."] * num_episodes*2
-    logger.info(f"Evaluating {num_episodes*2} episodes: {''.join(progress_dots)}", end="", flush=True)
+    progress_by_task = {
+        task: ["."] * eval_num_episode for task in candidate_tasks
+    }
+    logger.info(
+        f"Evaluating {eval_num_episode} episodes: {''.join(progress_by_task[task_prompt])}",
+        end="",
+        flush=True,
+    )
     image_keys = [
         # "observation.images.head_view",
         # "observation.images.wrist_right_view",
         # "observation.images.wrist_left_view",
         "observation.images.wrist_image_left",
-        "observation.images.exterior_image_1_left",
+        # "observation.images.exterior_image_1_left",
         "observation.images.exterior_image_2_left",
     ]
 
-    while done_episodes < num_episodes*2:
+    while done_episodes < total_episodes:
         # -----------------------------------------------------------
         # 1. Policy + Q prediction
         # -----------------------------------------------------------
@@ -379,25 +393,33 @@ def run_franka_evaluation(
             ep_combined_buffers[env_idx].append(combined_xyz.copy())
             ep_residual_buffers[env_idx].append(residual_xyz.copy())
             q_val = q_pred[env_idx].item() if q_pred.numel() > env_idx else float(q_pred.mean().item())
-            if done_episodes< num_episodes:
-                ep_q_preds_task_one[env_idx].append(q_val)
-            else:
-                ep_q_preds_task_two[env_idx].append(q_val)
+            ep_q_preds[env_idx].append(q_val)
 
         # -----------------------------------------------------------
         # 4. Episode 结束
         # -----------------------------------------------------------
         if done_flags:
             is_success = bool(reward.item() > 0.9)           
-            progress_dots[done_episodes] = "✓" if is_success else "✗"
+            task_episode_index = len(successes_by_task[task_prompt])
+            progress_by_task[task_prompt][task_episode_index] = "✓" if is_success else "✗"
             # logger.info(f"{reward}: {reward}")
-            logger.info(f"{task_prompt}: {progress_dots[done_episodes]}")
-            logger.info(f"Evaluating {num_episodes*2} episodes: {''.join(progress_dots)}", end="", flush=True)
-            if done_episodes< num_episodes:
-                successes_task_one.append(is_success)
-            else:
-                successes_task_two.append(is_success)
+            logger.info(f"{task_prompt}: {progress_by_task[task_prompt][task_episode_index]}")
+            logger.info(
+                f"Evaluating {eval_num_episode} episodes: "
+                f"{''.join(progress_by_task[task_prompt])}",
+                end="",
+                flush=True,
+            )
+            successes_by_task[task_prompt].append(is_success)
             successes.append(is_success)
+            if len(successes_by_task[task_prompt]) == eval_num_episode:
+                task_successes = successes_by_task[task_prompt]
+                success_count = sum(task_successes)
+                success_rate = success_count / eval_num_episode
+                logger.info(
+                    f"task {task_index + 1} success rate: {success_rate:.2%} "
+                    f"({success_count}/{eval_num_episode})"
+                )
             combined_traj = (
                 np.concatenate(ep_combined_buffers[0], axis=0)
                 if ep_combined_buffers[0] else np.zeros((0, 3))
@@ -409,25 +431,28 @@ def run_franka_evaluation(
             all_combined_trajs.append(combined_traj)
             all_residual_trajs.append(residual_traj)
 
-            all_q_trajectories_task_one.append(ep_q_preds_task_one[0].copy())
-            all_q_trajectories_task_two.append(ep_q_preds_task_two[0].copy())
+            all_q_trajectories_by_task[task_prompt].append(ep_q_preds[0].copy())
             # all_episode_lengths.append(len(ep_q_preds[0]))
 
             ep_combined_buffers[0] = []
             ep_residual_buffers[0] = []
 
-            ep_q_preds_task_one[0] = []
-            ep_q_preds_task_two[0] = []
+            ep_q_preds[0] = []
 
             done_episodes += 1
 
-            if done_episodes== num_episodes:
-
-                task_prompt = task_two
-                if switched ==False:
-                    logger.info("-----------------------switch to task two-------------------------")
-                    switched = True
-                next_obs = env.reset(task_prompt)
+            next_task_index = min(done_episodes // eval_num_episode, len(candidate_tasks) - 1)
+            if done_episodes < total_episodes and next_task_index != task_index:
+                task_index = next_task_index
+                task_prompt = candidate_tasks[task_index]
+                logger.info(f"---------------- task {task_index + 1}: {task_prompt} ----------------")
+                next_obs = env.reset(task_prompt, evaluate_previous=False)
+                logger.info(
+                    f"Evaluating {eval_num_episode} episodes: "
+                    f"{''.join(progress_by_task[task_prompt])}",
+                    end="",
+                    flush=True,
+                )
     
             task_emb = lang_embedder(task_prompt)
         next_obs = _attach_task_emb(next_obs,lang_cfg, task_emb)
@@ -439,34 +464,23 @@ def run_franka_evaluation(
     # ------------------------------------------------------------------
     # 5. Aggregate metrics + Q stats
     # ------------------------------------------------------------------
-    success_rate_task_one: float = float(np.mean(successes_task_one)) if successes_task_one else 0.0
-    success_rate_task_two: float = float(np.mean(successes_task_two)) if successes_task_two else 0.0
-
-    flat_q_task_one = (
-        np.concatenate([np.asarray(t, dtype=np.float32) for t in all_q_trajectories_task_one if len(t) > 0])
-        if any(len(t) > 0 for t in all_q_trajectories_task_one)
-        else np.zeros((0,), dtype=np.float32)
-    )
-
-    flat_q_task_two = (
-        np.concatenate([np.asarray(t, dtype=np.float32) for t in all_q_trajectories_task_two if len(t) > 0])
-        if any(len(t) > 0 for t in all_q_trajectories_task_two)
-        else np.zeros((0,), dtype=np.float32)
-    )
-    # succ_q = [np.mean(t) for t, ok in zip(all_q_trajectories, successes) if ok and len(t) > 0]
-    # fail_q = [np.mean(t) for t, ok in zip(all_q_trajectories, successes) if (not ok) and len(t) > 0]
-
-    metrics: dict[str, float] = {
-        "eval/success_rate_task_one": success_rate_task_one,
-        "eval/success_rate_task_two": success_rate_task_two,
-        "eval/q_mean_task_one": float(flat_q_task_one.mean()) if flat_q_task_one.size else 0.0,
-        "eval/q_mean_task_two": float(flat_q_task_two.mean()) if flat_q_task_two.size else 0.0,
-        # "eval/q_std": float(flat_q.std()) if flat_q.size else 0.0,
-        # "eval/q_min": float(flat_q.min()) if flat_q.size else 0.0,
-        # "eval/q_max": float(flat_q.max()) if flat_q.size else 0.0,
-        # "eval/q_mean_success": float(np.mean(succ_q)) if succ_q else 0.0,
-        # "eval/q_mean_failure": float(np.mean(fail_q)) if fail_q else 0.0,
-    }
+    metrics: dict[str, float] = {}
+    for index, task in enumerate(candidate_tasks):
+        task_successes = successes_by_task[task]
+        task_q_trajectories = all_q_trajectories_by_task[task]
+        nonempty_q = [
+            np.asarray(trajectory, dtype=np.float32)
+            for trajectory in task_q_trajectories
+            if trajectory
+        ]
+        flat_q = np.concatenate(nonempty_q) if nonempty_q else np.zeros((0,), dtype=np.float32)
+        metric_prefix = f"eval/task_{index + 1}"
+        metrics[f"{metric_prefix}/success_rate"] = (
+            float(np.mean(task_successes)) if task_successes else 0.0
+        )
+        metrics[f"{metric_prefix}/q_mean"] = (
+            float(flat_q.mean()) if flat_q.size else 0.0
+        )
 
     # ------------------------------------------------------------------
     # 6. Plots -> wandb
@@ -479,11 +493,14 @@ def run_franka_evaluation(
         all_residual_trajs, successes,
         title_prefix="Residual action", global_step=global_step,
     )
-    fig_q_task_one = _plot_q_trajectories(all_q_trajectories_task_one, successes, global_step=global_step) \
-        if save_q_plots else None
-    
-    fig_q_task_two = _plot_q_trajectories(all_q_trajectories_task_two, successes, global_step=global_step) \
-        if save_q_plots else None
+    q_figures = {
+        task: _plot_q_trajectories(
+            all_q_trajectories_by_task[task],
+            successes_by_task[task],
+            global_step=global_step,
+        )
+        for task in candidate_tasks
+    } if save_q_plots else {}
 
     if wandb.run is not None:
         log_dict = {
@@ -491,18 +508,15 @@ def run_franka_evaluation(
             "eval/xyz_trajectories_combined": wandb.Image(fig_combined),
             "eval/xyz_trajectories_residual": wandb.Image(fig_residual),
         }
-        if fig_q_task_one is not None:
-            log_dict["eval/q_trajectories_taks_one"] = wandb.Image(fig_q_task_one)
-        if fig_q_task_one is not None:
-            log_dict["eval/q_trajectories_taks_two"] = wandb.Image(fig_q_task_two)
+        for index, task in enumerate(candidate_tasks):
+            if task in q_figures:
+                log_dict[f"eval/task_{index + 1}/q_trajectories"] = wandb.Image(q_figures[task])
         wandb.log(log_dict, step=global_step)
 
     plt.close(fig_combined)
     plt.close(fig_residual)
-    if fig_q_task_one is not None:
-        plt.close(fig_q_task_one)
-    if fig_q_task_two is not None:
-        plt.close(fig_q_task_two)
+    for figure in q_figures.values():
+        plt.close(figure)
 
     logger.info("--------------------------------------------------------------------------------------")
 

@@ -131,7 +131,7 @@ class ResidualTD3DexmgConfig(RLPDDexmgConfig):
     save_replay_on_checkpoint: bool = False
     save_online_rb_interval: int = 1000  ### 5000
     send_transitions_len : int = 1  ### 
-    chunk_len: int = 4  # residual action chunk length H (actor/critic act_dim = H * per_step_dim)
+    chunk_len: int = 5  ################## # residual action chunk length H (actor/critic act_dim = H * per_step_dim)
 
 @dataclass
 class ResidualTD3CanConfig(ResidualTD3DexmgConfig):
@@ -208,13 +208,13 @@ class ResidualTD3BoxCleanConfig(ResidualTD3DexmgConfig):
     )
 
 @dataclass
-class ResidualTD3FrankaTomatoConfig(ResidualTD3DexmgConfig):
+class ResidualTD3FrankaComplexConfig(ResidualTD3DexmgConfig):
     # task: str = "FrankaTomatoPnP"
-    task: str = "pick up the tomato and place it into the bowl"
+    # task: str = "pick up the tomato and place it into the bowl"
 
     rl_camera: list[str] = field(
         default_factory=lambda: [
-            "observation.images.exterior_image_1_left",
+            # "observation.images.exterior_image_1_left",
             "observation.images.exterior_image_2_left",
             "observation.images.wrist_image_left",
         ]
@@ -226,12 +226,12 @@ class ResidualTD3FrankaTomatoConfig(ResidualTD3DexmgConfig):
         )
     )
 
-    wandb: WandBConfig = field(default_factory=lambda: WandBConfig(project="franka-tomato-residual-td3"))
+    wandb: WandBConfig = field(default_factory=lambda: WandBConfig(project="franka-complex-residual-td3"))
 
     offline_data: OfflineDataConfig = field(
         default_factory=lambda: OfflineDataConfig(
-            name="/home/yuan/self_vla/tele_op/lerobot/pi05_tomato_into",
-            num_episodes=1_000,
+            name="/home/yuan/self_vla/tele_op/lerobot/dataset",
+            num_episodes=190,
             horizon=400,   # 这里改成真实 episode 长度
         )
     )
@@ -356,5 +356,5 @@ cs.store(name="residual_td3_square_config", node=ResidualTD3SquareConfig)
 cs.store(name="residual_td3_box_clean_config", node=ResidualTD3BoxCleanConfig)
 cs.store(name="residual_td3_coffee_config", node=ResidualTD3CoffeeConfig)
 cs.store(name="residual_td3_two_arm_cansort_config", node=ResidualTD3TwoArmCanSortConfig)
-cs.store(name="residual_td3_franka_tomato_config", node=ResidualTD3FrankaTomatoConfig)
+cs.store(name="residual_td3_franka_complex_config", node=ResidualTD3FrankaComplexConfig)
 cs.store(name="residual_td3_franka_cube_config", node=ResidualTD3FrankaCubeConfig)

@@ -23,8 +23,8 @@ import time
 from loguru import logger
 
 from utils import process_policy_images, _extract_observation, prepare_image_256, to_hwc
-# from task_reward_generator import TaskRewardGenerator
-from task_reward_generator_nodino import TaskRewardGenerator
+from task_reward_generator import TaskRewardGenerator
+
 
 DROID_CONTROL_FREQUENCY = 10  # 15
 
@@ -46,7 +46,7 @@ def prevent_keyboard_interrupt():
             raise KeyboardInterrupt
 
 class Args:
-    max_timesteps: int = 200 # 150 # 200 # 180   
+    max_timesteps: int = 140 # 150 # 200 # 180   
 
     # GPT server(task_reward_generation_zedx.py)
     gpt_host: str = "127.0.0.1"  # 机器 IP
@@ -114,13 +114,13 @@ class BasePolicy:
         )
         self.gripper_position = self.obs["gripper_position"]
     
-    def save_debug_images(self, obs_left=None, obs_right=None, obs_wrist=None, save_dir="debug_images"):
+    def save_debug_images(self, obs_left, obs_right, obs_wrist, save_dir="debug_images"):
         os.makedirs(save_dir, exist_ok=True)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 
         images = {
-            # "left": obs_left,
+            "left": obs_left,
             "right": obs_right,
             "wrist": obs_wrist,
         }
@@ -136,7 +136,7 @@ class BasePolicy:
             cv2.imwrite(path, img_to_save)
 
     def get_obs_for_base(self, task_prompt):
-        # obs_left = copy.deepcopy(self.obs["left_image"])
+        obs_left = copy.deepcopy(self.obs["left_image"])
         obs_right = copy.deepcopy(self.obs["right_image"])
         obs_wrist = copy.deepcopy(self.obs["wrist_image"])
         eef_pose = copy.deepcopy(self.obs["cartesian_position"]) # [x, y, z, roll, pitch, yaw]
@@ -151,14 +151,13 @@ class BasePolicy:
             eef_quat = -eef_quat
         eef_pose_quat = np.concatenate([eef_pos, eef_quat], axis=-1)
 
-        # obs_left = prepare_image_256(obs_left)
+        obs_left = prepare_image_256(obs_left)
         obs_right = prepare_image_256(obs_right)
         obs_wrist = prepare_image_256(obs_wrist)
-        # self.save_debug_images(obs_left, obs_right, obs_wrist)
-        self.save_debug_images(obs_right = obs_right, obs_wrist = obs_wrist)
+        self.save_debug_images(obs_left, obs_right, obs_wrist)
 
         return{
-            # "observation/exterior_image_1_left": image_tools.resize_with_pad(obs_left, 224, 224),
+            "observation/exterior_image_1_left": image_tools.resize_with_pad(obs_left, 224, 224),
             "observation/wrist_image_left": image_tools.resize_with_pad(obs_right, 224, 224),
             "observation/exterior_image_2_left": image_tools.resize_with_pad(obs_wrist, 224, 224),
             "observation/eef_position": eef_pose_quat,
@@ -167,7 +166,7 @@ class BasePolicy:
         }
     
     def get_obs_for_residual(self, base_naction):
-        # obs_left = torch.as_tensor(prepare_image_256(to_hwc(copy.deepcopy(self.obs["left_image"]))), dtype=torch.uint8, device=self.device)
+        obs_left = torch.as_tensor(prepare_image_256(to_hwc(copy.deepcopy(self.obs["left_image"]))), dtype=torch.uint8, device=self.device)
         obs_right = torch.as_tensor(prepare_image_256(to_hwc(copy.deepcopy(self.obs["right_image"]))), dtype=torch.uint8, device=self.device)
         obs_wrist = torch.as_tensor(prepare_image_256(to_hwc(copy.deepcopy(self.obs["wrist_image"]))), dtype=torch.uint8, device=self.device)
         eef_pose = copy.deepcopy(np.asarray(self.obs["cartesian_position"], dtype=np.float32))
@@ -184,8 +183,8 @@ class BasePolicy:
         gripper_position = torch.as_tensor(gripper_position, dtype=torch.float32, device=self.device)
         base_naction = torch.as_tensor(base_naction, dtype=torch.float32, device=self.device)
 
-        # if obs_left.ndim == 3:
-        #     obs_left = obs_left.unsqueeze(0)
+        if obs_left.ndim == 3:
+            obs_left = obs_left.unsqueeze(0)
         if obs_right.ndim == 3:
             obs_right = obs_right.unsqueeze(0)
         if obs_wrist.ndim == 3:
@@ -203,7 +202,7 @@ class BasePolicy:
         obs = {
             "observation.state": state,
             "observation.base_action": base_naction,
-            # "observation.images.exterior_image_1_left": obs_left,
+            "observation.images.exterior_image_1_left": obs_left,
             "observation.images.exterior_image_2_left": obs_right,
             "observation.images.wrist_image_left": obs_wrist,
             "text": self.text,
@@ -212,14 +211,14 @@ class BasePolicy:
 
         return augemnted_obs
 
-    def reset(self, task_prompt=None, evaluate_previous=True):
+    def reset(self, task_prompt = None):
         self.t_step = 0
         self.env.reset()  # 1.593s
 
         self.pi05_client.reset()
         print("robot reset successfully")
         
-        if self.round != 0 and evaluate_previous:
+        if self.round != 0:
             self.update_obs()
             self.reward =  float(self.task_reward_generator.reward_generation(self.obs["right_image"], task_prompt))  # 0 or 1
             # print("reward:", self.reward)
@@ -230,9 +229,6 @@ class BasePolicy:
         self.update_obs()
         if self.evaluation ==False:
             self.text, self.round = self.task_reward_generator.task_generation(self.obs["right_image"])
-        elif task_prompt is not None:
-            self.task_reward_generator.start_task(self.obs["right_image"])
-            self.round = self.task_reward_generator.round
         print("current task:", self.text)
         if task_prompt==None:
             obs_for_pi0 = self.get_obs_for_base(self.text)
@@ -262,22 +258,19 @@ class BasePolicy:
         else:
             query_action_base = False
 
-        # obs_left = raw_obs["exterior_image_1_left"].detach().cpu().numpy()
+        obs_left = raw_obs["exterior_image_1_left"].detach().cpu().numpy()
         obs_right = raw_obs["wrist_image_left"].detach().cpu().numpy()
         obs_wrist = raw_obs["exterior_image_2_left"].detach().cpu().numpy()
         eef_pose = raw_obs["eef_position"].detach().cpu().numpy()  # [x, y, z, qx, qy, qz, qw]
         gripper_position = raw_obs["gripper_position"].detach().cpu().numpy()
-        # left_resized, right_resized, wrist_resized = process_policy_images(obs_left, obs_right, obs_wrist)
-
-        left_resized, right_resized, wrist_resized = process_policy_images(obs_left=None, obs_right = obs_right, obs_wrist = obs_wrist)
-
+        left_resized, right_resized, wrist_resized = process_policy_images(obs_left, obs_right, obs_wrist)
         
         if query_action_base:
             if eef_pose.ndim == 2 :
                 eef_pose = eef_pose.squeeze(0)
             
             request_data = {
-                # "observation/exterior_image_1_left": image_tools.resize_with_pad(left_resized, 224, 224),
+                "observation/exterior_image_1_left": image_tools.resize_with_pad(left_resized, 224, 224),
                 "observation/wrist_image_left": image_tools.resize_with_pad(right_resized, 224, 224),
                 "observation/exterior_image_2_left": image_tools.resize_with_pad(wrist_resized, 224, 224),
                 "observation/eef_position": eef_pose,
@@ -390,61 +383,6 @@ class BasePolicy:
         done = torch.as_tensor([done], dtype=torch.bool, device=self.device)
 
         return next_obs, reward, done, info
-
-    def current_base_chunk(self, chunk_len):
-        """Flat SCALED base-action chunk (1, chunk_len*dim) at the current step.
-        ``_last_base_action`` is already scaled; ``base_action_buffer`` holds the raw
-        upcoming steps of the current base plan (scaled here). Pads by repeating the
-        last valid entry when the base plan runs out.
-        """
-        first = torch.as_tensor(self._last_base_action, dtype=torch.float32, device=self.device).reshape(-1)
-        parts = [first]
-        for j in range(chunk_len - 1):
-            if j < len(self.base_action_buffer):
-                raw = torch.as_tensor(self.base_action_buffer[j], dtype=torch.float32, device=self.device)
-                parts.append(self.action_scaler.scale(raw).reshape(-1))
-            else:
-                parts.append(parts[-1].clone())
-        return torch.cat(parts, dim=-1).unsqueeze(0)
-    def step_chunk(self, residual_flat, task_prompt=None, evaluation=False):
-        """Open-loop execute one residual chunk.
-        ``residual_flat``: (1, chunk_len*dim). ``step`` already adds its own per-step
-        base action, so we only feed the residual slice each step. Returns the next
-        chunk-start obs, the executed combined action chunk (1, chunk_len*dim), the
-        accumulated (undiscounted) reward, done, and info. Reward is left undiscounted
-        because rewards are sparse/terminal (0/1) and eval checks ``reward > 0.9``;
-        cross-chunk discounting is handled by ``gamma_chunk = gamma**H`` in the buffer.
-        """
-        per_step_dim = torch.as_tensor(self._last_base_action).reshape(-1).shape[0]
-        residual = residual_flat.reshape(-1, per_step_dim)  # (H, m)
-        H = residual.shape[0]
-        combined_parts = []
-        reward_sum = 0.0
-        done = False
-        info = {}
-        next_obs = None
-        for h in range(H):
-            next_obs, r, d, info = self.step(
-                residual_action=residual[h : h + 1], task_prompt=task_prompt, evaluation=evaluation
-            )
-            combined_parts.append(info["scaled_action"].reshape(-1))  # (m,) scaled
-            reward_sum += float(r.sum().item())
-            if bool(d.any()):
-                done = True
-                break
-        while len(combined_parts) < H:  # pad on early termination
-            combined_parts.append(combined_parts[-1].clone())
-        combined = torch.stack(combined_parts, dim=0)  # (H, m) scaled
-        combined_flat = combined.reshape(1, -1)  # (1, H*m) -> buffer action
-        reward = torch.as_tensor([reward_sum], dtype=torch.float32, device=self.device)
-        done_t = torch.as_tensor([done], dtype=torch.bool, device=self.device)
-        out_info = {
-            "scaled_action": combined_flat,  # chunk-level combined action (for buffer)
-            "combined_action": self.action_scaler.unscale(combined),  # (H, m) unscaled (for eval plots)
-            "residual_action": residual,  # (H, m)
-            "task_prompt": self.text,
-        }
-        return next_obs, combined_flat, reward, done_t, out_info
 
     def get_transition(self, combined_action, query_action_base, task_prompt):
         # 转成 numpy，并去掉 batch 维

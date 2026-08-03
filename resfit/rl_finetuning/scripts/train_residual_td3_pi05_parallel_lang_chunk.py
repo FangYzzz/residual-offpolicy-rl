@@ -35,7 +35,7 @@ import numpy as np
 import tensordict
 import torch
 import torchrl
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from omegaconf import OmegaConf
 from tensordict import TensorDict
 from torch.utils.data import DataLoader
@@ -44,15 +44,15 @@ from tqdm import tqdm
 import threading
 import queue
 import wandb
-from resfit.dexmg.environments.dexmg import create_vectorized_env
-from resfit.lerobot.policies.act.configuration_act import ACTConfig
-from resfit.lerobot.policies.act.modeling_act import ACTPolicy
-from resfit.lerobot.utils.load_policy import download_policy_from_wandb, load_policy
+# from resfit.dexmg.environments.dexmg import create_vectorized_env
+# from resfit.lerobot.policies.act.configuration_act import ACTConfig
+# from resfit.lerobot.policies.act.modeling_act import ACTPolicy
+# from resfit.lerobot.utils.load_policy import download_policy_from_wandb, load_policy
 from resfit.rl_finetuning.config.residual_td3 import ResidualTD3DexmgConfig
 from resfit.rl_finetuning.off_policy.common_utils import utils
-from resfit.rl_finetuning.off_policy.rl.q_agent import QAgent
+from resfit.rl_finetuning.off_policy.rl.q_agent_lang import QAgentLang
 from resfit.rl_finetuning.utils.dtype import to_uint8
-from resfit.rl_finetuning.utils.evaluate_dexmg import run_dexmg_evaluation
+# from resfit.rl_finetuning.utils.evaluate_dexmg import run_dexmg_evaluation
 from resfit.rl_finetuning.utils.evaluate_franka import run_franka_evaluation
 from resfit.rl_finetuning.utils.hugging_face import (
     _hf_download_buffer,
@@ -60,9 +60,12 @@ from resfit.rl_finetuning.utils.hugging_face import (
     optimized_replay_buffer_dumps,
     optimized_replay_buffer_loads,
 )
+from resfit.rl_finetuning.config.rlpd import (
+    LanguageConfig,
+)
 from resfit.rl_finetuning.utils.normalization import ActionScaler, StateStandardizer
 from resfit.rl_finetuning.utils.rb_transforms import MultiStepTransform
-from resfit.rl_finetuning.wrappers.residual_env_wrapper import BasePolicyVecEnvWrapper
+# from resfit.rl_finetuning.wrappers.residual_env_wrapper import BasePolicyVecEnvWrapper
 from gpt_residual_robot import BasePolicy
 
 # -----------------------------------------------------------------------------
@@ -110,6 +113,140 @@ class TrainingTimer:
         """Reset all timing data."""
         self.times = defaultdict(list)
         self.reset_time = time.perf_counter()
+
+
+# -----------------------------------------------------------------------------
+# Language embedding helper ---------------------------------------------------
+# -----------------------------------------------------------------------------
+class LanguageEmbedder:
+    """Compute a fixed sentence embedding for a task / prompt string.
+
+    Frozen, lazy-loaded; the result is cached per string so we never re-run
+    the LM during data collection.
+
+    Default backend: ``sentence-transformers/all-MiniLM-L6-v2`` -> 384-dim
+    embedding.  Swap ``model_name`` for any other HuggingFace sentence /
+    text encoder; just keep ``cfg.agent.language.lang_emb_dim`` in sync.
+
+    If the ``sentence-transformers`` package is missing, falls back to a
+    deterministic hashed pseudo-embedding so the rest of the training
+    pipeline still runs (useful for plumbing checks).
+    """
+
+    def __init__(
+        self,
+        *,
+        emb_dim: int,
+        device: torch.device,
+        model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+    ) -> None:
+        self.emb_dim = emb_dim
+        self.device = device
+        self.model_name = model_name
+        self._cache: dict[str, torch.Tensor] = {}
+        self._model = None
+        self._loaded = False
+
+    def _maybe_load(self) -> None:
+        if self._loaded:
+            return
+        self._loaded = True
+        try:
+            from sentence_transformers import SentenceTransformer
+
+            self._model = SentenceTransformer(self.model_name, device=str(self.device))
+            self._model.eval()
+            actual_dim = int(self._model.get_sentence_embedding_dimension())
+            assert actual_dim == self.emb_dim, (
+                f"LanguageEmbedder: model '{self.model_name}' produces {actual_dim}-dim "
+                f"embeddings but cfg.agent.language.lang_emb_dim={self.emb_dim}. "
+                f"Either change the model or update the config."
+            )
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"⚠️  LanguageEmbedder: could not load '{self.model_name}' ({e}); "
+                f"falling back to deterministic hashed pseudo-embeddings. "
+                f"Install sentence-transformers for real embeddings."
+            )
+            self._model = None
+
+    def encode(self, text: str) -> torch.Tensor:
+        if text in self._cache:
+            return self._cache[text]
+        self._maybe_load()
+        if self._model is not None:
+            with torch.no_grad():
+                vec = self._model.encode(
+                    text,
+                    convert_to_tensor=True,
+                    normalize_embeddings=True,
+                ).to(self.device).float()
+        else:
+            seed = abs(hash(text)) % (2**31 - 1)
+            g = torch.Generator(device="cpu").manual_seed(seed)
+            vec = torch.randn(self.emb_dim, generator=g)
+            vec = (vec / vec.norm()).to(self.device).float()
+        self._cache[text] = vec
+        return vec
+
+    def __call__(self, text: str) -> torch.Tensor:
+        return self.encode(text)
+
+def _load_lerobot_task_prompts(dataset: LeRobotDataset, dataset_name: str) -> dict[int, str]:
+    """Read ``meta/tasks.jsonl`` and return task_index -> prompt."""
+    candidate_paths: list[Path] = []
+
+    dataset_root = getattr(dataset, "root", None)
+    if dataset_root is not None:
+        candidate_paths.append(Path(dataset_root) / "meta" / "tasks.jsonl")
+
+    dataset_meta_root = getattr(getattr(dataset, "meta", None), "root", None)
+    if dataset_meta_root is not None:
+        candidate_paths.append(Path(dataset_meta_root) / "tasks.jsonl")
+        candidate_paths.append(Path(dataset_meta_root) / "meta" / "tasks.jsonl")
+
+    name_path = Path(dataset_name).expanduser()
+    candidate_paths.append(name_path / "meta" / "tasks.jsonl")
+    candidate_paths.append(name_path / "tasks.jsonl")
+
+    tasks_path = next((path for path in candidate_paths if path.exists()), None)
+    if tasks_path is None:
+        searched = "\n  ".join(str(path) for path in candidate_paths)
+        raise FileNotFoundError(f"Could not find LeRobot tasks.jsonl. Searched:\n  {searched}")
+
+    task_prompts: dict[int, str] = {}
+    with tasks_path.open("r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            if "task_index" not in row or "task" not in row:
+                raise KeyError(f"{tasks_path}:{line_no} must contain 'task_index' and 'task'")
+            task_prompts[int(row["task_index"])] = str(row["task"])
+
+    if not task_prompts:
+        raise ValueError(f"No task prompts found in {tasks_path}")
+
+    print(f"Loaded {len(task_prompts)} task prompts from {tasks_path}")
+    return task_prompts
+
+def _inject_task_emb(
+    obs: dict[str, torch.Tensor], task_emb: torch.Tensor, key: str = "observation.task_emb"
+) -> dict[str, torch.Tensor]:
+    """Set ``obs[key]`` to ``task_emb`` (broadcast to whatever batch dim the
+    rest of obs has).  Mutates ``obs`` in place and returns it for chaining.
+    """
+    # print("type(obs)::::::::::::::::::", type(obs))
+    if key in obs:
+        return obs
+    state = obs.get("observation.state", None)
+    if state is not None and state.dim() == 2:
+        emb = task_emb.unsqueeze(0).expand(state.size(0), -1).contiguous()
+    else:
+        emb = task_emb
+    obs[key] = emb.to(state.device if state is not None else task_emb.device)
+    return obs
 
 
 # -----------------------------------------------------------------------------
@@ -215,6 +352,7 @@ def save_training_checkpoint(
     episode_count: int,
     actor_updates: int,
     run_name: str,
+    task_output_root: str,
     cfg,
 ):
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
@@ -234,6 +372,7 @@ def save_training_checkpoint(
         "actor": agent.actor.state_dict(),
         "critic": agent.critic.state_dict(),
         "encoders": agent.encoders.state_dict(),
+        "lang_encoder": agent.lang_encoder.state_dict(),
         "actor_target": agent.actor_target.state_dict(),
         "critic_target": agent.critic_target.state_dict(),
 
@@ -258,6 +397,7 @@ def save_training_checkpoint(
         "episode_count": episode_count,
         "actor_updates": actor_updates,
         "run_name": run_name,
+        "task_output_root": task_output_root,
         "wandb_run_id": wandb.run.id if wandb.run is not None else None,
         "cfg": OmegaConf.to_container(cfg, resolve=True),
 
@@ -347,6 +487,7 @@ def load_training_checkpoint(
     actor_updates = checkpoint.get("actor_updates", 0)
     run_name = checkpoint.get("run_name", None)
     wandb_run_id = checkpoint.get("wandb_run_id", None)
+    task_output_root = checkpoint.get("task_output_root", None)
 
     # Restore RNG states
     if "python_random_state" in checkpoint:
@@ -381,6 +522,7 @@ def load_training_checkpoint(
         "actor_updates": actor_updates,
         "run_name": run_name,
         "wandb_run_id": wandb_run_id,
+        "task_output_root": task_output_root,
     }
 
 
@@ -445,6 +587,8 @@ def _add_transitions_to_buffer(
 
 def collector_loop(
         cfg,
+        lang_cfg,
+        lang_embedder,
         device,
         base_policy,
         image_keys,
@@ -469,8 +613,87 @@ def collector_loop(
         episode_idx = int(initial_episode_count)
         best_eval_success_rate = initial_best_eval_success_rate
 
-        obs = base_policy.reset()
-        agent = QAgent(obs_shape=(img_c, img_h, img_w),
+        task_names = list(base_policy.task_reward_generator.candidate_tasks)
+        initial_probability = 1.0 / len(task_names)
+        task_success_stats = {
+            task: {
+                "attempts": 0,
+                "successes": 0,
+                "success_rate": 0.0,
+                "probability": initial_probability,
+            }
+            for task in task_names
+        }
+
+        def _print_eval_success_rates(eval_metrics):
+            for index, task in enumerate(task_names, start=1):
+                success_rate = eval_metrics[f"eval/task_{index}/success_rate"]
+                print(f"🎉 task {index} ({task}) success rate: {success_rate}")
+
+        def _update_task_probabilities(completed_task, succeeded):
+            """Increase sampling probability for tasks with lower success rates."""
+            if completed_task not in task_success_stats:
+                logging.warning("Unknown generated task; not updating stats: %s", completed_task)
+                return
+
+            stats = task_success_stats[completed_task]
+            stats["attempts"] += 1
+            stats["successes"] += int(succeeded)
+            stats["success_rate"] = stats["successes"] / stats["attempts"]
+
+            # Beta(1, 1) smoothing makes the probability change gradually and
+            # gives every untried task the same initial estimated rate (0.5).
+            exploration_floor = 0.05
+            priorities = {}
+            for task, task_stats in task_success_stats.items():
+                smoothed_success_rate = (
+                    task_stats["successes"] + 1
+                ) / (task_stats["attempts"] + 2)
+                priorities[task] = (1.0 - smoothed_success_rate) + exploration_floor
+
+            priority_sum = sum(priorities.values())
+            probabilities = {
+                task: priority / priority_sum
+                for task, priority in priorities.items()
+            }
+            for task, probability in probabilities.items():
+                task_success_stats[task]["probability"] = probability
+
+            # TaskRewardGenerator still applies scene feasibility constraints;
+            # these probabilities are normalized again over feasible tasks only.
+            base_policy.task_reward_generator.task_probabilities = probabilities
+
+            task_metrics = {}
+            for index, task in enumerate(task_names):
+                task_metrics[f"tasks/task_{index}_success_rate"] = task_success_stats[task]["success_rate"]
+                task_metrics[f"tasks/task_{index}_probability"] = task_success_stats[task]["probability"]
+                task_metrics[f"tasks/task_{index}_attempts"] = task_success_stats[task]["attempts"]
+            wandb.log(task_metrics, step=global_step)
+            print(f"[collector] task success stats: {task_success_stats}")
+
+        # All tasks start with equal probability.
+        base_policy.task_reward_generator.task_probabilities = {
+            task: initial_probability for task in task_names
+        }
+
+        # obs = base_policy.reset()
+        def _attach_task_emb(obs, task_emb):
+            if not lang_cfg.enabled or task_emb is None or obs is None:
+                return obs
+            return _inject_task_emb(obs, task_emb, key=lang_cfg.lang_emb_obs_key)
+        initial_eval_completed = False
+        if cfg.eval_first and global_step == 0:
+            # Initial evaluation performs its own task-specific resets. Avoid a
+            # normal reset here, which would generate an unused random task.
+            obs = None
+            task_prompt = None
+            task_emb = None
+        else:
+            base_policy.task_reward_generator.set_output_cycle(global_step)
+            obs, task_prompt = base_policy.reset()
+            task_emb = lang_embedder(task_prompt)
+            obs = _attach_task_emb(obs, task_emb)
+        agent = QAgentLang(obs_shape=(img_c, img_h, img_w),
                             prop_shape=(lowdim_dim,),
                             action_dim=action_dim,
                             rl_cameras=image_keys,
@@ -489,6 +712,7 @@ def collector_loop(
                 agent.actor.load_state_dict(latest["actor"])
                 agent.encoders.load_state_dict(latest["encoders"])
                 agent.critic.load_state_dict(latest["critic"])
+                agent.lang_encoder.load_state_dict(latest["lang_encoder"])
                 # print("[collector] rollout actor updated #########################" )
 
 
@@ -498,36 +722,87 @@ def collector_loop(
 
             episode_steps = []
             episode_done = False
+            episode_task_prompt = task_prompt
             
             while not episode_done and global_step <= cfg.algo.total_timesteps and (not stop_event.is_set()) and len(episode_steps)<cfg.send_transitions_len:
+                if cfg.eval_first and global_step == 0 and not initial_eval_completed:
+                    # 在训练开始前先 eval 一次，看看 base policy 的表现
+                    with training_timer.time("evaluation"):
+                        eval_metrics = run_franka_evaluation(
+                            env=base_policy,  ## todo eval?
+                            agent=agent,
+                            eval_num_episode=cfg.eval_num_episodes,
+                            device=device,
+                            global_step=global_step,
+                            save_video=cfg.save_video,
+                            save_q_plots=cfg.save_video,  # Enable Q-plots when video saving is enabled
+                            run_name=run_name,
+                            output_dir=outputs_dir,
+                            lang_cfg = lang_cfg,
+                            lang_embedder= lang_embedder,
+                            chunk_len=cfg.chunk_len,  ##################
+                        )
+    
+                        _print_eval_success_rates(eval_metrics)
+                    obs, task_prompt = base_policy.reset(evaluate_previous=False)
+                    task_emb = lang_embedder(task_prompt)
+                    obs = _attach_task_emb(obs, task_emb)
+                    episode_task_prompt = task_prompt
+                    initial_eval_completed = True
+                    
                 with torch.no_grad(), utils.eval_mode(agent):
                     # print("cfg.algo.stddev_schedule:", cfg.algo.stddev_schedule)  # 0.003
                     stddev = utils.schedule(cfg.algo.stddev_schedule, global_step)
                     # print("stddev:", stddev)  # 0.0030000000000000005
+                    # Attach the base-action chunk (H*dim) so actor/critic see chunk-level base.
+                    obs["observation.base_action"] = base_policy.current_base_chunk(cfg.chunk_len)  ##################
                     obs_act = process_image_batch(copy.deepcopy(obs), image_keys, enc_type, rb=False)
-                    action = agent.act(obs_act, eval_mode=False, stddev=stddev, cpu=False)
+                    action = agent.act(obs_act, eval_mode=False, stddev=stddev, cpu=False)  # (1, H*dim)
 
                 if cfg.algo.progressive_clipping_steps > 0:
                     clip_factor = min(1.0, global_step / cfg.algo.progressive_clipping_steps)  # 训练一开始不要让 residual action 太大，而是慢慢放开
                     action = action * clip_factor  # 让 residual policy 在训练早期影响较小，避免一开始破坏 base policy
 
-                next_obs, reward, done, info = base_policy.step(residual_action=action)
+                # Open-loop execute the whole residual chunk; store ONE chunk macro-transition.
+                next_obs, combined_chunk, reward, done, info = base_policy.step_chunk(action.reshape(1, -1))  ##################
+                # next_obs, reward, done, info = base_policy.step(residual_action=action)
 
+                # BasePolicy returns a per-step base action (m,), but a chunk
+                # transition requires next_obs to contain the next H*m chunk.
+                next_obs["observation.base_action"] = base_policy.current_base_chunk(cfg.chunk_len)
+                
+                if done:
+                    task_prompt = info["task_prompt"]
+                    task_emb = lang_embedder(task_prompt)
+                next_obs = _attach_task_emb(next_obs, task_emb)
                 if done.any():
                     episode_count += done.float().sum().item()
                     episode_done = True
-                    wandb.log(
-                        {
-                            "training/reward": reward
-                        },
-                        step= global_step,
+
+                    terminal_reward = float(reward.sum().item())
+                    _update_task_probabilities(
+                        completed_task=episode_task_prompt,
+                        succeeded=terminal_reward > 0.5,
                     )
+
+                    # Reward is sparse/terminal -> only log it at episode end.
+                    _log = {"training/reward": terminal_reward}  ##################
+                    if getattr(agent, "last_rollout_gate_adopt_rate", None) is not None:
+                        _log["rollout/gate_adopt_rate"] = agent.last_rollout_gate_adopt_rate
+                    wandb.log(_log, step=global_step)  ##################
+                    # wandb.log(
+                    #     {
+                    #         "training/reward": reward
+                    #     },
+                    #     step= global_step,
+                    # )
 
                 # 注意：这里先不 add_to_buffer，而是存起来（仍然是一步）
                 step_payload = {
                     "obs": obs,
                     "next_obs": next_obs,
-                    "action": info["scaled_action"],  # combined action
+                    # "action": info["scaled_action"],  # combined action
+                    "action": combined_chunk,  # combined action chunk (1, H*dim)
                     "reward": reward,
                     "done": done,
                     "info": info,
@@ -548,7 +823,7 @@ def collector_loop(
             print(f"[collector] pushed episode {episode_idx}, len={len(episode_steps)}, global_step={global_step}")
 
             episode_idx += 1
-            if global_step % cfg.eval_interval_every_steps == 0 and (cfg.eval_first or global_step > 0):
+            if global_step % cfg.eval_interval_every_steps == 0 and ( global_step > 0):
                 with training_timer.time("evaluation"):
                     eval_metrics = run_franka_evaluation(
                         env=base_policy,  ## todo eval?
@@ -560,18 +835,21 @@ def collector_loop(
                         save_q_plots=cfg.save_video,  # Enable Q-plots when video saving is enabled
                         run_name=run_name,
                         output_dir=outputs_dir,
+                        lang_cfg = lang_cfg,
+                        lang_embedder= lang_embedder,
+                        chunk_len=cfg.chunk_len,  ##################
                     )
 
-                    # Handle model saving when success rate improves
-                    current_success_rate = eval_metrics["eval/success_rate"]
-                    if current_success_rate > best_eval_success_rate:
-                        print(f"🎉 New best success rate: {current_success_rate:.4f} (prev: {best_eval_success_rate:.4f})")
-                        best_eval_success_rate = current_success_rate
-                obs = base_policy.reset()
+                    _print_eval_success_rates(eval_metrics)
+                obs, task_prompt = base_policy.reset(evaluate_previous=False)
+                task_emb = lang_embedder(task_prompt)
+                obs = _attach_task_emb(obs, task_emb)
             # 原来 eval 后会 reset，这里 episode 结束也 reset
             # obs = base_policy.reset()
             
-            global_step += cfg.send_transitions_len
+            # global_step += cfg.send_transitions_len
+            # Each collected transition spans one chunk = chunk_len env steps.
+            global_step += cfg.send_transitions_len * cfg.chunk_len  ##################
         stop_event.set()
         print("[collector] finished")
 
@@ -590,6 +868,7 @@ def learner_loop(
         stop_event,
         model_save_dir,
         run_name,
+        task_output_root,
         online_cache_dir,
         online_cache_meta,
         online_cache_hash,
@@ -619,14 +898,16 @@ def learner_loop(
         weights_queue.put({
             "actor": {k: v.detach().cpu() for k, v in agent.actor.state_dict().items()},
             "encoders": {k: v.detach().cpu() for k, v in agent.encoders.state_dict().items()},
-            "critic": {k: v.detach().cpu() for k, v in agent.critic.state_dict().items()}
+            "critic": {k: v.detach().cpu() for k, v in agent.critic.state_dict().items()},
+            "lang_encoder": {k: v.detach().cpu() for k, v in agent.lang_encoder.state_dict().items()}
         })
 
         def _publish_latest_actor():
             payload = {
                 "actor": {k: v.detach().cpu() for k, v in agent.actor.state_dict().items()},
                 "encoders": {k: v.detach().cpu() for k, v in agent.encoders.state_dict().items()},
-                "critic": {k: v.detach().cpu() for k, v in agent.critic.state_dict().items()}
+                "critic": {k: v.detach().cpu() for k, v in agent.critic.state_dict().items()},
+                "lang_encoder": {k: v.detach().cpu() for k, v in agent.lang_encoder.state_dict().items()}
             }
             # 保持 queue 里尽量只有最新
             try:
@@ -819,6 +1100,7 @@ def learner_loop(
                     episode_count=episode_count,
                     actor_updates=actor_updates,
                     run_name=run_name,
+                    task_output_root=task_output_root,
                     cfg=cfg,
                 )
 
@@ -834,12 +1116,9 @@ def learner_loop(
 # Main training loop -----------------------------------------------------------
 # -----------------------------------------------------------------------------
 def main(cfg: ResidualTD3DexmgConfig):
-    print("cfg.algo.random_action_noise_scale:::::", cfg.algo.random_action_noise_scale)
-    print("cfg.task:::::", cfg.task)
     device_str = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device_str)
     enc_type=cfg.agent.enc_type
-    print("agent.enc_type:::::", enc_type)
 
     # Enable performance optimizations
     if device.type == "cuda":
@@ -943,13 +1222,41 @@ def main(cfg: ResidualTD3DexmgConfig):
     lowdim_dim = 8  # 8+8
     # img_c, img_h, img_w =3, 224, 224
     img_c, img_h, img_w =3, 84, 84
-    action_dim = 8
+    # action_dim = 8
+    ##################
+    per_step_dim = 8
+    chunk_len = cfg.chunk_len
+    action_dim = per_step_dim * chunk_len  # actor/critic act_dim = chunk_len * per_step_dim
+    # n-step is accumulated OVER CHUNKS, so bootstrap discount is gamma**H.
+    gamma_chunk = cfg.algo.gamma ** chunk_len
+    # Buffer/learning_starts counters are in STEP units; convert to chunk counts.
+    online_buffer_size_chunks = max(1, cfg.algo.buffer_size // chunk_len)
+    learning_starts_chunks = max(1, cfg.algo.learning_starts // chunk_len)
+    ##################
     lowdim_keys = ["observation.state", "observation.base_action"]
+
+    # ---------------------------------------------------------------------
+    # Language / task embedding -------------------------------------------
+    # ---------------------------------------------------------------------
+    lang_cfg: LanguageConfig = cfg.agent.language
+    if lang_cfg.enabled:
+        lang_embedder = LanguageEmbedder(
+            emb_dim=lang_cfg.lang_emb_dim,
+            device=device,
+        )
+        # task_emb = lang_embedder(cfg.task)
+        # print(f"🗣  task='{cfg.task}' -> task_emb shape={tuple(task_emb.shape)}")
+        dataset_task_prompts = _load_lerobot_task_prompts(dataset, cfg.offline_data.name)
+        lowdim_keys = ["observation.state", "observation.base_action", lang_cfg.lang_emb_obs_key]
+    else:
+        lang_embedder = None
+        dataset_task_prompts = {}
+        lowdim_keys = ["observation.state", "observation.base_action"]
 
     # ---------------------------------------------------------------------
     # Networks ------------------------------------------------------------
     # ---------------------------------------------------------------------
-    agent = QAgent(
+    agent = QAgentLang(
         obs_shape=(img_c, img_h, img_w),
         prop_shape=(lowdim_dim,),
         action_dim=action_dim,
@@ -957,6 +1264,11 @@ def main(cfg: ResidualTD3DexmgConfig):
         cfg=cfg.agent,
         residual_actor=True,  # Enable residual actor mode
     ) 
+    
+    def _attach_task_emb(obs, task_emb):
+        if not lang_cfg.enabled or task_emb is None or obs is None:
+            return obs
+        return _inject_task_emb(obs, task_emb, key=lang_cfg.lang_emb_obs_key)
 
     # horizon = env.vec_env.metadata["horizon"]  # todo
     horizon = cfg.offline_data.horizon
@@ -987,12 +1299,15 @@ def main(cfg: ResidualTD3DexmgConfig):
 
     # Use TensorDictPrioritizedReplayBuffer with optimized prefetching
     online_rb = TensorDictPrioritizedReplayBuffer(
-        storage=LazyTensorStorage(max_size=cfg.algo.buffer_size, device="cpu"),
-        alpha=alpha,
+        # storage=LazyTensorStorage(max_size=cfg.algo.buffer_size, device="cpu"),
+        storage=LazyTensorStorage(max_size=online_buffer_size_chunks, device="cpu"),alpha=alpha,  ##################
         beta=beta,
         eps=1e-6,  # Small epsilon added to priorities to prevent zero values
         priority_key="_priority",
-        transform=MultiStepTransform(n_steps=cfg.algo.n_step, gamma=cfg.algo.gamma),
+        # transform=MultiStepTransform(n_steps=cfg.algo.n_step, gamma=cfg.algo.gamma),
+        # One buffer entry = one chunk macro-transition; n-step is accumulated over
+        # chunks with gamma_chunk = gamma**chunk_len.
+        transform=MultiStepTransform(n_steps=cfg.algo.n_step, gamma=gamma_chunk),  ##################
         pin_memory=True,
         prefetch=cfg.algo.prefetch_batches,  # Add prefetching
         batch_size=online_batch_size,
@@ -1006,6 +1321,12 @@ def main(cfg: ResidualTD3DexmgConfig):
         "image_keys": image_keys,
         "n_step": cfg.algo.n_step,
         "gamma": cfg.algo.gamma,
+        "chunk_len": chunk_len,  ##################
+        "gamma_chunk": gamma_chunk,  ##################
+        # v2 guarantees that both obs and next_obs store H*m base-action chunks.
+        # Bumping this schema also prevents loading older malformed caches whose
+        # next observation still contained a single m-dimensional action.
+        "storage": "chunk_v2_next_base_chunk",
         "horizon": horizon,
         "size": cfg.algo.learning_starts,
         "sampling_strategy": cfg.algo.sampling_strategy,
@@ -1088,7 +1409,9 @@ def main(cfg: ResidualTD3DexmgConfig):
         beta=beta,
         eps=1e-6,  # Small epsilon added to priorities to prevent zero values
         priority_key="_priority",
-        transform=MultiStepTransform(n_steps=cfg.algo.n_step, gamma=cfg.algo.gamma),
+        # Same MultiStep-over-chunks framework as the online buffer.
+        transform=MultiStepTransform(n_steps=cfg.algo.n_step, gamma=gamma_chunk),  ##################
+        # transform=MultiStepTransform(n_steps=cfg.algo.n_step, gamma=cfg.algo.gamma),
         pin_memory=True,
         prefetch=cfg.algo.prefetch_batches,  # Add prefetching
         batch_size=max(offline_batch_size, 1),  # Ensure batch_size is at least 1
@@ -1127,16 +1450,29 @@ def main(cfg: ResidualTD3DexmgConfig):
             raise ValueError("base_policy must be provided when use_base_policy_for_base_actions=True")
 
         # Populate buffer from pre-loaded dataset
-        print("Populating offline buffer from dataset...")
+        # print("Populating offline buffer from dataset...")
+        # Populate buffer with CHUNK macro-transitions (same format as online chunks):
+        #   obs_t     = state_t, base_chunk = base_action[t : t+H]
+        #   action    = GT action chunk[t : t+H]
+        #   next_obs  = state_{t+H}, base_chunk[t+H : t+2H]
+        #   reward    = Σ_{h<n} gamma^h r_{t+h}   (n = steps until first done / H)
+        #   done      = a terminal fell inside [t, t+H)
+        # Chunks are STRIDE-H (non-overlapping) so MultiStepTransform (gamma_chunk)
+        # accumulates the n-step over-chunks return without double counting.
+        H = chunk_len  ##################
+        print("Populating offline buffer from dataset (chunk transitions)...")
         loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)   # todo define the offline data :  dataset
 
-        episode_cache: dict[int, dict] = {}
+        # 1) One per-frame pass -> per-episode frame records (kept on CPU).
+        episodes: dict[int, list[dict]] = defaultdict(list)  ##################
+        # episode_cache: dict[int, dict] = {}
         transitions = 0
         step_id = 0
 
         for sample in tqdm(loader, desc="Processing offline dataset"):  # 用进度条逐样本处理
             ep_idx = int(sample["episode_index"].item())
-            if num_episodes is not None and ep_idx == num_episodes:
+            # if num_episodes is not None and ep_idx == num_episodes:
+            if num_episodes is not None and ep_idx >= num_episodes:  ##################
                 break
 
             # ------------------------------------------------------------------
@@ -1145,7 +1481,8 @@ def main(cfg: ResidualTD3DexmgConfig):
             # Extract data and keep on CPU (replay buffer uses CPU storage)
             # _gt_action: torch.Tensor = sample["action"].float().squeeze(0)
             _gt_action: torch.Tensor = sample["eef_actions"].float().squeeze(0)
-            gt_action_scaled = action_scaler.scale(_gt_action)
+            # gt_action_scaled = action_scaler.scale(_gt_action)
+            gt_action_scaled = action_scaler.scale(_gt_action).reshape(-1).cpu()  ##################
             # done_flag = bool(sample["next.done"].item())
             if "next.done" in sample:  # todo!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
                 done_flag = bool(sample["next.done"].item())
@@ -1155,7 +1492,9 @@ def main(cfg: ResidualTD3DexmgConfig):
                 done_flag = False
             
             if done_flag:
-                print(f"episode done at {step_id}")
+                ep_idx = int(sample["episode_index"].item())
+                frame_idx = int(sample["frame_index"].item())
+                print(f"episode {ep_idx} done at frame {frame_idx}")
 
             # Generate base action based on the selected mode
             if use_base_policy_for_base_actions:
@@ -1170,44 +1509,155 @@ def main(cfg: ResidualTD3DexmgConfig):
                 with torch.no_grad():
                     # base_action = base_policy.select_action(raw_obs)
                     # _, base_action, _, _, _ = base_policy.get_obs_and_base_action(raw_obs=raw_obs)  # todo done
-                    base_action = base_policy.get_offline_action_base(raw_obs)  # base_action shape:(8,)
+                    task_index = int(sample["task_index"].item())
+                    task_prompt = dataset_task_prompts[task_index]
+                    base_action = base_policy.get_offline_action_base(raw_obs, task_prompt)  # base_action shape:(8,)
                 base_action = torch.as_tensor(base_action, dtype=torch.float32)
-                base_action_scaled = action_scaler.scale(base_action.cpu())
+                # base_action_scaled = action_scaler.scale(base_action.cpu())
+                base_action_scaled = action_scaler.scale(base_action.cpu()).reshape(-1)  ##################
             else:
                 # Use GT action as base action (original behavior)
-                base_action_scaled = gt_action_scaled
+                # base_action_scaled = gt_action_scaled
+
+                ##################
+                # Use GT action as base action (residual target 0)
+                base_action_scaled = gt_action_scaled.clone()
+            state = torch.cat((sample["eef_position"], sample["gripper_position"].unsqueeze(-1)), dim=-1)
+            frame = {
+                "state": state_standardizer.standardize(state.float().squeeze(0)).cpu(),
+                "base": base_action_scaled,          # (m,)
+                "gt": gt_action_scaled,              # (m,)
+                "reward": float(done_flag),         # sparse terminal reward
+                "done": done_flag,
+            }
+            img = {}
+            ##################
 
             # Build observation dict directly in target format'
-            state = torch.cat((sample["eef_position"],sample["gripper_position"].unsqueeze(-1)),dim = -1)
-            curr_obs = {
-                "observation.state": state_standardizer.standardize(state.float().squeeze(0)),  # todo 
-                "observation.base_action": base_action_scaled,
-            }
+            # state = torch.cat((sample["eef_position"],sample["gripper_position"].unsqueeze(-1)),dim = -1)
+            # curr_obs = {
+            #     "observation.state": state_standardizer.standardize(state.float().squeeze(0)),  # todo 
+            #     "observation.base_action": base_action_scaled,
+            # }
             for k in image_keys:
                 raw_k = k.replace("observation.images.", "")
-                curr_obs[k] = sample[raw_k].squeeze(0)
-            curr_obs = process_image_batch(curr_obs, image_keys, enc_type, rb=True)  ###
-            # Convert images to uint8 for memory-efficient storage
-            to_uint8(curr_obs, image_keys)
+            #     curr_obs[k] = sample[raw_k].squeeze(0)
+            # curr_obs = process_image_batch(curr_obs, image_keys, enc_type, rb=True)  ###
+            # # Convert images to uint8 for memory-efficient storage
+            # to_uint8(curr_obs, image_keys)
+                ##################
+                img[k] = sample[raw_k].squeeze(0)
+            img = process_image_batch(img, image_keys, enc_type, rb=True)  ###
+            to_uint8(img, image_keys)
+            for k in image_keys:
+                frame[k] = img[k]
+                ##################
 
-            # ------------------------------------------------------------------
-            # If we already cached the *previous* frame for this episode we can
-            # create transitions now.
-            # ------------------------------------------------------------------
-            if ep_idx in episode_cache:
-                # Create transitions for each combination of prev and current variants
-                prev_obs = episode_cache[ep_idx]["obs"]
-                # prev_obs = process_image_batch(prev_obs, image_keys, enc_type, rb=True)  ###
-                prev_action_scaled = episode_cache[ep_idx]["action"]
+            # Inject task embedding from the dataset's per-frame task_index.
+            if lang_cfg.enabled:
+                if lang_embedder is None:
+                    raise RuntimeError("lang_embedder must be initialized when language is enabled")
+                if "task_index" not in sample:
+                    raise KeyError("Dataset sample is missing 'task_index'; cannot build task embedding")
+                task_index = int(sample["task_index"].item())
+                if task_index not in dataset_task_prompts:
+                    raise KeyError(
+                        f"task_index={task_index} was not found in tasks.jsonl "
+                        f"(available: {sorted(dataset_task_prompts)})"
+                    )
+        #         task_prompt = dataset_task_prompts[task_index]
+        #         curr_task_emb = lang_embedder(task_prompt)
+        #         curr_obs[lang_cfg.lang_emb_obs_key] = curr_task_emb.detach().cpu()
+
+        #     # ------------------------------------------------------------------
+        #     # If we already cached the *previous* frame for this episode we can
+        #     # create transitions now.
+        #     # ------------------------------------------------------------------
+        #     if ep_idx in episode_cache:
+        #         # Create transitions for each combination of prev and current variants
+        #         prev_obs = episode_cache[ep_idx]["obs"]
+        #         # prev_obs = process_image_batch(prev_obs, image_keys, enc_type, rb=True)  ###
+        #         prev_action_scaled = episode_cache[ep_idx]["action"]
+                
+        #         transition = TensorDict(
+        #             {
+        #                 "obs": TensorDict(prev_obs, batch_size=[]),
+        #                 "action": prev_action_scaled,
+        #                 "next": TensorDict(
+        #                     {
+        #                         "obs": TensorDict(curr_obs, batch_size=[]),
+        #                         "done": torch.tensor(done_flag, dtype=torch.bool),
+        #                         "reward": torch.tensor(float(done_flag), dtype=torch.float32),
+        #                     },
+        #                     batch_size=[],
+        #                 ),
+        #                 "_priority": torch.tensor(10.0, dtype=torch.float32),  # High initial priority for new samples
+        #             },
+        #             batch_size=[],
+        #         ).unsqueeze(0)
+
+        #         rb.add(transition)
+        #         transitions += 1
+
+        #         step_id += 1
+        #     else:
+        #         step_id = 0
+
+        #     # Cache current frame for pairing with the next one ---------------
+        #     episode_cache[ep_idx] = {
+        #         "obs": curr_obs,
+        #         "action": gt_action_scaled,
+        #         "done": done_flag,
+        #         "step_id": step_id,
+        #     }
+
+        # # Log final statistics
+        # print(f"Added {transitions} transitions")
+
+        ##################
+                frame[lang_cfg.lang_emb_obs_key] = lang_embedder(dataset_task_prompts[task_index]).detach().cpu()
+
+            episodes[ep_idx].append(frame)
+
+        # 2) Assemble non-overlapping (stride-H) chunk transitions per episode.
+        transitions = 0
+        for _ep, frames in episodes.items():
+            T = len(frames)
+            for t in range(0, T - 1, H):
+                # executed steps in this chunk: up to H, stop right after first terminal
+                n, term = 0, False
+                while n < H and (t + n) < T:
+                    is_done = frames[t + n]["done"]
+                    n += 1
+                    if is_done:
+                        term = True
+                        break
+                last_valid = t + n - 1
+                idxs = [min(t + h, last_valid) for h in range(H)]
+                nt = min(t + H, T - 1)
+                nidxs = [min(nt + h, T - 1) for h in range(H)]
+                base_chunk = torch.stack([frames[i]["base"] for i in idxs], dim=0).reshape(-1)     # (H*m,)
+                action_chunk = torch.stack([frames[i]["gt"] for i in idxs], dim=0).reshape(-1)     # (H*m,)
+                next_base_chunk = torch.stack([frames[i]["base"] for i in nidxs], dim=0).reshape(-1)
+                R = sum((cfg.algo.gamma ** h) * frames[t + h]["reward"] for h in range(n))
+                cur_obs = {"observation.state": frames[t]["state"], "observation.base_action": base_chunk}
+                next_obs = {"observation.state": frames[nt]["state"], "observation.base_action": next_base_chunk}
+                for k in image_keys:
+                    cur_obs[k] = frames[t][k]
+                    next_obs[k] = frames[nt][k]
+                if lang_cfg.enabled:
+                    cur_obs[lang_cfg.lang_emb_obs_key] = frames[t][lang_cfg.lang_emb_obs_key]
+                    next_obs[lang_cfg.lang_emb_obs_key] = frames[nt][lang_cfg.lang_emb_obs_key]
+
                 transition = TensorDict(
                     {
-                        "obs": TensorDict(prev_obs, batch_size=[]),
-                        "action": prev_action_scaled,
+                        "obs": TensorDict(cur_obs, batch_size=[]),
+                        "action": action_chunk,
                         "next": TensorDict(
                             {
-                                "obs": TensorDict(curr_obs, batch_size=[]),
-                                "done": torch.tensor(done_flag, dtype=torch.bool),
-                                "reward": torch.tensor(float(done_flag), dtype=torch.float32),
+                                 "obs": TensorDict(next_obs, batch_size=[]),
+                                "done": torch.tensor(bool(term), dtype=torch.bool),
+                                "reward": torch.tensor(float(R), dtype=torch.float32),
                             },
                             batch_size=[],
                         ),
@@ -1215,24 +1665,12 @@ def main(cfg: ResidualTD3DexmgConfig):
                     },
                     batch_size=[],
                 ).unsqueeze(0)
-
                 rb.add(transition)
                 transitions += 1
-
-                step_id += 1
-            else:
-                step_id = 0
-
-            # Cache current frame for pairing with the next one ---------------
-            episode_cache[ep_idx] = {
-                "obs": curr_obs,
-                "action": gt_action_scaled,
-                "done": done_flag,
-                "step_id": step_id,
-            }
-
         # Log final statistics
-        print(f"Added {transitions} transitions")
+
+        print(f"Added {transitions} offline chunk transitions")
+        ##################
 
         return transitions
 
@@ -1250,6 +1688,9 @@ def main(cfg: ResidualTD3DexmgConfig):
         "image_keys": image_keys,
         "n_step": cfg.algo.n_step,
         "gamma": cfg.algo.gamma,
+        "chunk_len": chunk_len,  ##################
+        "gamma_chunk": gamma_chunk,  ##################
+        "storage": "chunk_v1",  ################## # chunk macro-transition format; never mix with per-step caches
         "base_policy_wandb_id": cfg.base_policy.wandb_id,
         "sampling_strategy": cfg.algo.sampling_strategy,
         "normalized_actions": True,
@@ -1321,10 +1762,22 @@ def main(cfg: ResidualTD3DexmgConfig):
     # Warm-up phase (random policy) --------------------------------------
     # ------------------------------------------------------------------
 
-    if len(online_rb) < cfg.algo.learning_starts and not loaded_online_from_cache and not getattr(cfg, "resume", False):
-        print(f"Warm-up: filling online buffer with {cfg.algo.learning_starts - len(online_rb)} random steps…")
+    # if len(online_rb) < cfg.algo.learning_starts and not loaded_online_from_cache and not getattr(cfg, "resume", False):
+    #     print(f"Warm-up: filling online buffer with {cfg.algo.learning_starts - len(online_rb)} random steps…")
+    if len(online_rb) < learning_starts_chunks and not loaded_online_from_cache and not getattr(cfg, "resume", False):  ##################
+        warmup_dir = base_policy.task_reward_generator.set_output_warmup()
+        print(f"Warm-up: filling online buffer with {learning_starts_chunks - len(online_rb)} random chunks "  ##################
+              f"({(learning_starts_chunks - len(online_rb)) * chunk_len} steps)…")  ##################
+        print(f"Warm-up artifacts: {warmup_dir}")
         # obs, _ = env.reset()
-        obs = base_policy.reset() # todo reset
+        # obs = base_policy.reset() # todo reset
+        # task_one = "pick up the cube and place it into the bowl"
+        # task_two = "pick up the cube from the bowl and place it outside the bowl"
+        # task_prompt = task_one
+        # task_emb = lang_embedder(task_prompt)
+        obs, task_prompt = base_policy.reset()
+        task_emb = lang_embedder(task_prompt)
+        obs = _attach_task_emb(obs= obs,task_emb=task_emb)
         # --------------------------------------------------------------
         # Logging helper: print progress every 1 000 collected transitions
         # --------------------------------------------------------------
@@ -1333,42 +1786,70 @@ def main(cfg: ResidualTD3DexmgConfig):
         reward_sum = 0
         episode_count = 0
 
-        while len(online_rb) < cfg.algo.learning_starts:
+        # while len(online_rb) < cfg.algo.learning_starts:
+        while len(online_rb) < learning_starts_chunks:  ##################
             print(f"[warmup] len(online_rb) before step = {len(online_rb)}")
+
+            # Attach the base-action chunk (H*dim) so the stored obs is chunk-level.
+            obs["observation.base_action"] = base_policy.current_base_chunk(chunk_len)  ##################
+
             if cfg.algo.use_base_policy_for_warmup:
-                # Use base policy action + noise (residual exploration)
-                # Since the environment wrapper always adds base_action to residual_action,
-                # we just need to provide the noise as the residual action
+                # # Use base policy action + noise (residual exploration)
+                # # Since the environment wrapper always adds base_action to residual_action,
+                # # we just need to provide the noise as the residual action
+                # Use base policy action + noise (residual exploration). The chunk client
+                # adds the per-step base action, so the residual chunk is just the noise.
                 rand_actions = (  # line2: Sample noise εt ∼ U (−noise scale, noise scale)
                     torch.rand((cfg.num_envs, action_dim), device=device) * 2 - 1
                 ) * cfg.algo.random_action_noise_scale
             else:
-                # Pure uniform random actions - need to cancel out the base policy action
-                # Since env does: combined = base_action + residual_action
-                # To get pure random: residual_action = random - base_action
-                # base_action = obs["observation.base_action"]  # Already normalized to [-1, 1]
-                base_action = base_policy._last_base_action # todo need to normailize  ************may need to reset??
+                # # Pure uniform random actions - need to cancel out the base policy action
+                # # Since env does: combined = base_action + residual_action
+                # # To get pure random: residual_action = random - base_action
+                # # base_action = obs["observation.base_action"]  # Already normalized to [-1, 1]
+                # base_action = base_policy._last_base_action # todo need to normailize  ************may need to reset??
+                # Pure uniform random chunk - cancel out the base action chunk.
+                # Since env does: combined = base_chunk + residual_chunk
+                base_chunk = base_policy.current_base_chunk(chunk_len)  ################## # (1, H*dim), scaled
 
                 pure_random = (
                     torch.rand((cfg.num_envs, action_dim), device=device) * 2 - 1
                 ) * cfg.algo.random_action_noise_scale
-                rand_actions = pure_random - base_action
+                # rand_actions = pure_random - base_action
+                rand_actions = pure_random - base_chunk  ##################
 
-            # line4: Observe next state st+1, reward rt, done flag dt
-            # next_obs, reward, terminated, truncated, info = env.step(rand_actions)  # line3: Step env with at = εt + atb where atb ∼ πb(st)
+            # # line4: Observe next state st+1, reward rt, done flag dt
+            # # next_obs, reward, terminated, truncated, info = env.step(rand_actions)  # line3: Step env with at = εt + atb where atb ∼ πb(st)
 
-            # next_obs, base_action, reward, terminated, truncated, info = base_policy.step(residual_action=rand_actions) # todo need to return  reward, terminated, truncated, info  normalize 
-            # done = terminated | truncated
-            next_obs, reward, done, info = base_policy.step(residual_action=rand_actions) # todo need to return  reward, terminated, truncated, info  normalize 
+            # # next_obs, base_action, reward, terminated, truncated, info = base_policy.step(residual_action=rand_actions) # todo need to return  reward, terminated, truncated, info  normalize 
+            # # done = terminated | truncated
+            # next_obs, reward, done, info = base_policy.step(residual_action=rand_actions ) # todo need to return  reward, terminated, truncated, info  normalize 
+            
+            # line3-4: open-loop execute the residual chunk; observe next chunk-start obs
+            next_obs, combined_action, reward, done, info = base_policy.step_chunk(rand_actions)
+
+            # Store a true chunk-level next observation. Without this assignment,
+            # online next_obs has shape (m,) while offline next_obs has (H*m,),
+            # causing torch.cat to fail during mixed critic warm-up.
+            next_obs["observation.base_action"] = base_policy.current_base_chunk(chunk_len)
+
             # print(f"[warmup] after step: reward={reward}, done={done}")
-
+            task_prompt = info["task_prompt"]
+            task_emb = lang_embedder(task_prompt)
+            next_obs = _attach_task_emb(next_obs, task_emb)
             reward_sum += reward.sum().item()
             episode_count += done.float().sum().item()
             # reward_sum += reward
             # episode_count += int(done)
-
+            if done:
+                if reward>0:
+                    res = "✓"
+                else:
+                    res = "✗"
+                print(f"task: {task_prompt} : {res}")
             # Use the executed combined action returned by the environment
-            combined_action = info["scaled_action"]
+            # combined_action = info["scaled_action"]
+            # combined_action is the executed combined action chunk (1, H*dim)
             _add_transitions_to_buffer(  # line5: Add transition (st, atb, at, st+1, atb+1, rt, dt) to online replay buffer
                 obs=obs,
                 next_obs=next_obs,
@@ -1383,6 +1864,7 @@ def main(cfg: ResidualTD3DexmgConfig):
                 online_rb=online_rb,
                 enc_type=enc_type
             )
+            
 
             # ----------------------------------------------------------
             # Progress logging (every ~1 000 transitions) --------------
@@ -1390,8 +1872,10 @@ def main(cfg: ResidualTD3DexmgConfig):
             if len(online_rb) >= next_log_threshold:  # todo
                 success_rate = reward_sum / episode_count if episode_count > 0 else 0.0
                 print(
-                    f"[Warm-up] {len(online_rb)} / {cfg.algo.learning_starts} "
-                    f"transitions collected, reward_sum={reward_sum:.2f}, "
+                    # f"[Warm-up] {len(online_rb)} / {cfg.algo.learning_starts} "
+                    # f"transitions collected, reward_sum={reward_sum:.2f}, "
+                    f"[Warm-up] {len(online_rb)} / {learning_starts_chunks} "  ##################
+                    f"chunks collected ({len(online_rb) * chunk_len} steps), reward_sum={reward_sum:.2f}, "  ##################
                     f"success_rate={success_rate:.3f} ({reward_sum}/{episode_count})"
                 )
                 next_log_threshold += 1000
@@ -1429,6 +1913,22 @@ def main(cfg: ResidualTD3DexmgConfig):
         training_cum_time = resume_state["training_cum_time"]
         episode_count = resume_state["episode_count"]
         actor_updates = resume_state["actor_updates"]
+
+        if resume_state.get("task_output_root"):
+            base_policy.task_reward_generator.restore_output_root(
+                resume_state["task_output_root"]
+            )
+            print(
+                "Resuming task artifacts in: "
+                f"{base_policy.task_reward_generator.output_root}"
+            )
+        else:
+            print(
+                "Checkpoint has no task_output_root; using a new task artifact "
+                f"directory: {base_policy.task_reward_generator.output_root}"
+            )
+
+    base_policy.task_reward_generator.output_root.mkdir(parents=True, exist_ok=True)
 
     _hp_parts: list[str] = [
         cfg.task,  # e.g. "TwoArmBoxCleanup"
@@ -1521,7 +2021,7 @@ def main(cfg: ResidualTD3DexmgConfig):
     outputs_dir.mkdir(parents=True, exist_ok=True)
 
     # obs, _ = env.reset()
-    obs = base_policy.reset() # todo reset
+    # obs = base_policy.reset() # todo reset
 
     train_start_time = time.time()
 
@@ -1616,6 +2116,8 @@ def main(cfg: ResidualTD3DexmgConfig):
         collector_thread = threading.Thread(
             target=collector_loop,
             args=( cfg,
+                    lang_cfg,
+                    lang_embedder,
                     device,
                     base_policy,
                     image_keys,
@@ -1653,6 +2155,7 @@ def main(cfg: ResidualTD3DexmgConfig):
                     stop_event,
                     model_save_dir,
                     run_name,
+                    str(base_policy.task_reward_generator.output_root),
                     online_cache_dir,
                     online_cache_meta,
                     online_cache_hash,
