@@ -43,6 +43,51 @@ class BasePolicyConfig:
 
 
 @dataclass
+class RLTokenConfig:
+    """RL-Token bottleneck and cache settings (disabled for legacy trainers)."""
+
+    enabled: bool = False
+    # Optional smoke-test limit. When set, this overrides
+    # offline_data.num_episodes for embedding collection, VAE training, and
+    # offline replay construction so every stage uses the same subset.
+    offline_num_episodes: int | None = 460
+    obs_key: str = "observation.rl_token"
+    vla_embedding_key: str = "vla_embedding"
+    embedding_cache_dir: str = "vla_embedding_cache"
+    checkpoint_dir: str = "rl_token_checkpoints"
+    force_recollect_embeddings: bool = False
+    # Number of embeddings buffered in RAM before an atomic disk shard is
+    # written. Raw VLA sequences are never accumulated for the full dataset.
+    embedding_shard_size: int = 32
+    embedding_storage_dtype: str = "int8"
+    force_retrain: bool = False
+    token_dim: int = 512
+    model_dim: int = 1024
+    encoder_layers: int = 2
+    decoder_layers: int = 2
+    num_heads: int = 8
+    dropout: float = 0.1
+    batch_size: int = 4
+    # Upper bound for padded sequence tokens per VAE minibatch. This
+    # automatically reduces batch_size for long pi0 prefix sequences.
+    max_tokens_per_batch: int = 1024
+    epochs: int = 50
+    validation_fraction: float = 0.1
+    early_stopping_patience: int = 5
+    early_stopping_min_delta: float = 1e-4
+    split_seed: int = 0
+    max_train_samples_per_epoch: int | None = 10_000
+    max_validation_samples: int | None = 2_000
+    learning_rate: float = 1e-4
+    weight_decay: float = 1e-4
+    gradient_clip_norm: float = 1.0
+    beta_kl: float = 1e-4
+    num_workers: int = 0
+    # Request final VLA prefix features (all camera views + language tokens).
+    request_field: str = "return_vla_embedding"
+
+
+@dataclass
 class ResidualTD3AlgoConfig(RLPDAlgoConfig):
     # ------------------------------------------------------------------
     # Critic warmup phase ----------------------------------------------
@@ -63,12 +108,17 @@ class ResidualTD3AlgoConfig(RLPDAlgoConfig):
     # False: residual_action = pure_random - base_action (resulting in pure_random)
     use_base_policy_for_warmup: bool = True
 
+    # Whether a resumed training process should discard the per-task Beta
+    # success-rate statistics and restart every task from 0.5. Set to False
+    # to restore those statistics from the training checkpoint.
+    reset_task_success_rates_on_restart: bool = False  # Restore per-task success rates from the checkpoint on resume.
+
     # ------------------------------------------------------------------
     # Standard deviation schedule -------------------------------------------
     # ------------------------------------------------------------------
-    stddev_max: float = 0.008 # 0.05
-    stddev_min: float = 0.008 # 0.05
-    stddev_step: int = 300_000
+    stddev_max: float = 0.006 # 0.05
+    stddev_min: float = 0.001 # 0.05
+    stddev_step: int = 100_000 # 300_000
 
     # Progressive clipping schedule for the residual actions
     # I.e., starts clipping linearly from 0 to action scale over progressive_clipping_steps steps
@@ -112,6 +162,8 @@ class ResidualTD3DexmgConfig(RLPDDexmgConfig):
     # ------------------------------------------------------------------
     base_policy: BasePolicyConfig = field(default_factory=BasePolicyConfig)
 
+    rl_token: RLTokenConfig = field(default_factory=RLTokenConfig)
+
     # ------------------------------------------------------------------
     # Weights & Biases logging
     # ------------------------------------------------------------------
@@ -120,15 +172,32 @@ class ResidualTD3DexmgConfig(RLPDDexmgConfig):
     # ------------------------------------------------------------------
     # Logging / checkpointing
     # ------------------------------------------------------------------
-    eval_interval_every_steps: int = 10_000  ### 10_000
+    # Save robot debug-camera frames and GPT before/after scene images for
+    # evaluation, online training, and online replay-buffer warmup.
+    save_images: bool = True
+
+    eval_interval_every_steps: int = 40_000  ### 10_000
 
     # Whether to run an evaluation pass before training begins (at step 0)
     eval_first: bool = True  ### True
 
     resume: bool = False
     resume_checkpoint: str | None = None
+    # Set this only when the periodic evaluation at resume_checkpoint's
+    # global_step completed before the previous process stopped. The collector
+    # continues at the next chunk instead of repeating that step/evaluation;
+    # later evaluation intervals are unchanged.
+    skip_completed_eval_on_resume: bool = False
     checkpoint_interval: int = 1000  ### 5000
-    save_replay_on_checkpoint: bool = False
+    # Replay buffers must be checkpointed together with the model so that
+    # global_step and buffer/online_size stay consistent after resuming.
+    save_replay_on_checkpoint: bool = True
+    # Keep checkpoints and artifacts in the original run directory when
+    # resuming, instead of creating run_<new timestamp>_<name> each time.
+    reuse_run_dir_on_resume: bool = True
+    # Checkpoints are required for future resume, so preserve the run directory
+    # after a normal training completion unless cleanup is explicitly requested.
+    cleanup_run_dir_on_finish: bool = False
     save_online_rb_interval: int = 1000  ### 5000
     send_transitions_len : int = 1  ### 
     chunk_len: int = 5  ################## # residual action chunk length H (actor/critic act_dim = H * per_step_dim)
@@ -230,8 +299,8 @@ class ResidualTD3FrankaComplexConfig(ResidualTD3DexmgConfig):
 
     offline_data: OfflineDataConfig = field(
         default_factory=lambda: OfflineDataConfig(
-            name="/home/yuan/self_vla/tele_op/lerobot/dataset",
-            num_episodes=190,
+            name="/home/yuan/self_vla/tele_op/lerobot/dataset_7050_7050_5050_7050",
+            num_episodes=460,
             horizon=400,   # 这里改成真实 episode 长度
         )
     )

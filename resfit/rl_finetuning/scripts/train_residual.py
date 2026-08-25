@@ -1214,7 +1214,10 @@ def main(cfg: ResidualTD3DexmgConfig):
             online_rb=online_rb,
             offline_rb=offline_rb,
             device=device,
-            load_replay_buffers=False,
+            # Restore the replay buffers saved beside this exact checkpoint.
+            # Otherwise global_step resumes from the checkpoint while the
+            # buffer may come from an older cache, producing a size jump.
+            load_replay_buffers=cfg.save_replay_on_checkpoint,
         )
 
         global_step = resume_state["global_step"]

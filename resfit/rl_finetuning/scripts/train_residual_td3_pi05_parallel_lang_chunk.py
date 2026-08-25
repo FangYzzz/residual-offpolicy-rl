@@ -23,6 +23,7 @@ import pprint
 import random
 import shutil
 import time
+import dataclasses
 from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime
@@ -51,6 +52,15 @@ import wandb
 from resfit.rl_finetuning.config.residual_td3 import ResidualTD3DexmgConfig
 from resfit.rl_finetuning.off_policy.common_utils import utils
 from resfit.rl_finetuning.off_policy.rl.q_agent_lang import QAgentLang
+from resfit.rl_finetuning.off_policy.rl.q_agent_rl_token import QAgentRLToken
+from resfit.rl_finetuning.utils.rl_token_pipeline import (
+    append_embedding_shard,
+    artifact_id,
+    bottleneck_id,
+    encode_all,
+    initialize_embedding_store,
+    train_or_load_rl_token,
+)
 from resfit.rl_finetuning.utils.dtype import to_uint8
 # from resfit.rl_finetuning.utils.evaluate_dexmg import run_dexmg_evaluation
 from resfit.rl_finetuning.utils.evaluate_franka import run_franka_evaluation
@@ -255,6 +265,29 @@ def _inject_task_emb(
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
+
+def _config_to_container(cfg) -> dict:
+    """Return a plain config dict for both Hydra configs and dataclasses."""
+    if OmegaConf.is_config(cfg):
+        container = OmegaConf.to_container(cfg, resolve=True)
+    elif dataclasses.is_dataclass(cfg):
+        container = dataclasses.asdict(cfg)
+    else:
+        raise TypeError(f"Unsupported config type: {type(cfg).__name__}")
+    if not isinstance(container, dict):
+        raise TypeError(f"Expected config mapping, got {type(container).__name__}")
+    return container
+
+
+def _make_agent(experiment_cfg, **kwargs):
+    if getattr(experiment_cfg, "rl_token", None) is not None and experiment_cfg.rl_token.enabled:
+        return QAgentRLToken(
+            **kwargs,
+            token_dim=experiment_cfg.rl_token.token_dim,
+            token_obs_key=experiment_cfg.rl_token.obs_key,
+        )
+    return QAgentLang(**kwargs)
+
 # -----------------------------------------------------------------------------
 # Hugging Face buffer cache helpers (global) ---------------------------------
 # -----------------------------------------------------------------------------
@@ -285,6 +318,9 @@ ONLINE_CACHE_DIR = _CACHE_ROOT / "online_buffer_cache"
 #     del os.environ["MUJOCO_EGL_DEVICE_ID"]
 
 def process_image_batch(obs_dict, image_keys, enc_type= "vit", rb=False):
+    # RL tokens are already compact features, not pixels.
+    if image_keys and all(k in obs_dict and obs_dict[k].ndim <= 2 for k in image_keys):
+        return obs_dict
     """
     将 obs_dict 里的多个图像键统一处理成 [3, out_size, out_size]
     输入每张图预期是 [H, W, C] 或 [1, H, W, C]
@@ -346,6 +382,7 @@ def process_image_batch(obs_dict, image_keys, enc_type= "vit", rb=False):
 def save_training_checkpoint(
     ckpt_path: Path,
     agent,
+    online_rb,
     global_step: int,
     best_eval_success_rate: float,
     training_cum_time: float,
@@ -353,9 +390,24 @@ def save_training_checkpoint(
     actor_updates: int,
     run_name: str,
     task_output_root: str,
+    task_success_stats: dict,
     cfg,
+    save_replay_buffer: bool = False,
 ):
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+
+    replay_size = len(online_rb)
+    replay_dir = ckpt_path.parent / f"{ckpt_path.stem}_replay" / "online_rb"
+
+    # A training checkpoint and its online replay data describe one logical
+    # state.  Persist the replay data first so a model checkpoint is never
+    # published while its matching buffer is still missing.  The generic
+    # online cache may lag behind by save_online_rb_interval and therefore is
+    # not safe for exact resume.
+    if save_replay_buffer:
+        if replay_dir.exists():
+            shutil.rmtree(replay_dir)
+        optimized_replay_buffer_dumps(online_rb, replay_dir)
 
     checkpoint = {
         "global_step": global_step,
@@ -372,7 +424,7 @@ def save_training_checkpoint(
         "actor": agent.actor.state_dict(),
         "critic": agent.critic.state_dict(),
         "encoders": agent.encoders.state_dict(),
-        "lang_encoder": agent.lang_encoder.state_dict(),
+        "lang_encoder": agent.lang_encoder.state_dict() if agent.lang_encoder is not None else None,
         "actor_target": agent.actor_target.state_dict(),
         "critic_target": agent.critic_target.state_dict(),
 
@@ -398,8 +450,15 @@ def save_training_checkpoint(
         "actor_updates": actor_updates,
         "run_name": run_name,
         "task_output_root": task_output_root,
+        "task_success_stats": copy.deepcopy(task_success_stats),
+        "online_replay_size": replay_size,
+        "online_replay_dir": (
+            str(replay_dir.relative_to(ckpt_path.parent))
+            if save_replay_buffer
+            else None
+        ),
         "wandb_run_id": wandb.run.id if wandb.run is not None else None,
-        "cfg": OmegaConf.to_container(cfg, resolve=True),
+        "cfg": _config_to_container(cfg),
 
         # RNG states
         "python_random_state": random.getstate(),
@@ -410,6 +469,11 @@ def save_training_checkpoint(
 
     torch.save(checkpoint, ckpt_path)
     print(f"Saved checkpoint to {ckpt_path}")
+    if save_replay_buffer:
+        print(
+            f"Saved matching online replay buffer to {replay_dir} "
+            f"(size={replay_size} chunks)"
+        )
 
     
 
@@ -418,10 +482,39 @@ def save_training_checkpoint(
 def load_training_checkpoint(
     ckpt_path: str | Path,
     agent,
+    online_rb,
     device: torch.device,
+    load_replay_buffer: bool = False,
 ):
     ckpt_path = Path(ckpt_path)
     checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+
+    if load_replay_buffer:
+        replay_dir_value = checkpoint.get("online_replay_dir")
+        if replay_dir_value is None:
+            raise RuntimeError(
+                "Checkpoint has no recorded online_replay_dir. Strict resume "
+                "requires a checkpoint created by the replay-on-checkpoint "
+                "code; generic caches and manually staged sidecars are not "
+                "accepted."
+            )
+        replay_dir = ckpt_path.parent / replay_dir_value
+        if not replay_dir.exists():
+            raise FileNotFoundError(
+                f"Matching online replay buffer not found: {replay_dir}"
+            )
+        online_rb.sampler._empty()
+        optimized_replay_buffer_loads(online_rb, replay_dir)
+        expected_replay_size = checkpoint.get("online_replay_size")
+        if expected_replay_size is not None and len(online_rb) != expected_replay_size:
+            raise RuntimeError(
+                "Online replay buffer size mismatch for checkpoint "
+                f"{ckpt_path}: expected {expected_replay_size}, loaded {len(online_rb)}"
+            )
+        print(
+            f"Loaded matching online replay buffer from {replay_dir} "
+            f"(size={len(online_rb)} chunks)"
+        )
 
     # ---------- Networks ---------------------------------------------------
     # Prefer the full-agent state_dict if present (new format); this restores
@@ -488,6 +581,7 @@ def load_training_checkpoint(
     run_name = checkpoint.get("run_name", None)
     wandb_run_id = checkpoint.get("wandb_run_id", None)
     task_output_root = checkpoint.get("task_output_root", None)
+    task_success_stats = checkpoint.get("task_success_stats", None)
 
     # Restore RNG states
     if "python_random_state" in checkpoint:
@@ -523,6 +617,7 @@ def load_training_checkpoint(
         "run_name": run_name,
         "wandb_run_id": wandb_run_id,
         "task_output_root": task_output_root,
+        "task_success_stats": task_success_stats,
     }
 
 
@@ -565,6 +660,16 @@ def _add_transitions_to_buffer(
         to_uint8(curr_obs_i, image_keys)
         to_uint8(next_obs_i, image_keys)
 
+        prev_residual_last = info.get("prev_residual_last")
+        has_prev_residual = bool(info.get("has_prev_residual", False))
+        if prev_residual_last is None:
+            residual = torch.as_tensor(info["residual_action"], device=device)
+            prev_residual_last = torch.zeros_like(residual.reshape(-1, residual.shape[-1])[-1])
+        else:
+            prev_residual_last = torch.as_tensor(
+                prev_residual_last, dtype=torch.float32, device=device
+            ).reshape(-1)
+
         td = TensorDict(
             {
                 "obs": TensorDict(curr_obs_i, batch_size=[]),
@@ -577,6 +682,10 @@ def _add_transitions_to_buffer(
                     batch_size=[],
                 ),
                 "action": actions[i],
+                "prev_residual_last": prev_residual_last,
+                "has_prev_residual": torch.tensor(
+                    has_prev_residual, dtype=torch.bool, device=device
+                ),
                 "_priority": torch.tensor(10.0, dtype=torch.float32),  # High initial priority for new samples
             },
             batch_size=[],
@@ -609,21 +718,21 @@ def collector_loop(
         initial_best_eval_success_rate=-float("inf"),
     ):
         global_step = initial_global_step
+        if (
+            getattr(cfg, "skip_completed_eval_on_resume", False)
+            and initial_global_step > 0
+        ):
+            global_step += cfg.send_transitions_len * cfg.chunk_len
+            print(
+                "[collector] periodic evaluation at resumed step "
+                f"{initial_global_step} was already completed; continuing "
+                f"collection at step {global_step}"
+            )
         episode_count = initial_episode_count
         episode_idx = int(initial_episode_count)
         best_eval_success_rate = initial_best_eval_success_rate
 
         task_names = list(base_policy.task_reward_generator.candidate_tasks)
-        initial_probability = 1.0 / len(task_names)
-        task_success_stats = {
-            task: {
-                "attempts": 0,
-                "successes": 0,
-                "success_rate": 0.0,
-                "probability": initial_probability,
-            }
-            for task in task_names
-        }
 
         def _print_eval_success_rates(eval_metrics):
             for index, task in enumerate(task_names, start=1):
@@ -631,50 +740,36 @@ def collector_loop(
                 print(f"🎉 task {index} ({task}) success rate: {success_rate}")
 
         def _update_task_probabilities(completed_task, succeeded):
-            """Increase sampling probability for tasks with lower success rates."""
-            if completed_task not in task_success_stats:
-                logging.warning("Unknown generated task; not updating stats: %s", completed_task)
+            """Log the success rates already updated by TaskRewardGenerator."""
+            if completed_task not in base_policy.task_reward_generator.task_success_stats:
+                logging.warning("Unknown generated task; not logging stats: %s", completed_task)
                 return
 
-            stats = task_success_stats[completed_task]
-            stats["attempts"] += 1
-            stats["successes"] += int(succeeded)
-            stats["success_rate"] = stats["successes"] / stats["attempts"]
-
-            # Beta(1, 1) smoothing makes the probability change gradually and
-            # gives every untried task the same initial estimated rate (0.5).
-            exploration_floor = 0.05
-            priorities = {}
-            for task, task_stats in task_success_stats.items():
-                smoothed_success_rate = (
-                    task_stats["successes"] + 1
-                ) / (task_stats["attempts"] + 2)
-                priorities[task] = (1.0 - smoothed_success_rate) + exploration_floor
-
+            priorities = {
+                task: base_policy.task_reward_generator.get_task_sampling_weight(task)
+                for task in task_names
+            }
             priority_sum = sum(priorities.values())
             probabilities = {
                 task: priority / priority_sum
                 for task, priority in priorities.items()
             }
-            for task, probability in probabilities.items():
-                task_success_stats[task]["probability"] = probability
-
-            # TaskRewardGenerator still applies scene feasibility constraints;
-            # these probabilities are normalized again over feasible tasks only.
-            base_policy.task_reward_generator.task_probabilities = probabilities
 
             task_metrics = {}
             for index, task in enumerate(task_names):
-                task_metrics[f"tasks/task_{index}_success_rate"] = task_success_stats[task]["success_rate"]
-                task_metrics[f"tasks/task_{index}_probability"] = task_success_stats[task]["probability"]
-                task_metrics[f"tasks/task_{index}_attempts"] = task_success_stats[task]["attempts"]
+                stats = base_policy.task_reward_generator.task_success_stats[task]
+                task_metrics[f"tasks/task_{index}_success_rate"] = (
+                    base_policy.task_reward_generator.get_task_success_rate(task)
+                )
+                task_metrics[f"tasks/task_{index}_probability"] = probabilities[task]
+                task_metrics[f"tasks/task_{index}_attempts"] = (
+                    stats["successes"] + stats["failures"] - 2.0
+                )
             wandb.log(task_metrics, step=global_step)
-            print(f"[collector] task success stats: {task_success_stats}")
-
-        # All tasks start with equal probability.
-        base_policy.task_reward_generator.task_probabilities = {
-            task: initial_probability for task in task_names
-        }
+            print(
+                "[collector] task success stats: "
+                f"{base_policy.task_reward_generator.task_success_stats}"
+            )
 
         # obs = base_policy.reset()
         def _attach_task_emb(obs, task_emb):
@@ -682,6 +777,7 @@ def collector_loop(
                 return obs
             return _inject_task_emb(obs, task_emb, key=lang_cfg.lang_emb_obs_key)
         initial_eval_completed = False
+        previous_residual_last = None
         if cfg.eval_first and global_step == 0:
             # Initial evaluation performs its own task-specific resets. Avoid a
             # normal reset here, which would generate an unused random task.
@@ -691,9 +787,9 @@ def collector_loop(
         else:
             base_policy.task_reward_generator.set_output_cycle(global_step)
             obs, task_prompt = base_policy.reset()
-            task_emb = lang_embedder(task_prompt)
+            task_emb = lang_embedder(task_prompt) if lang_embedder is not None else None
             obs = _attach_task_emb(obs, task_emb)
-        agent = QAgentLang(obs_shape=(img_c, img_h, img_w),
+        agent = _make_agent(cfg, obs_shape=(img_c, img_h, img_w),
                             prop_shape=(lowdim_dim,),
                             action_dim=action_dim,
                             rl_cameras=image_keys,
@@ -712,7 +808,8 @@ def collector_loop(
                 agent.actor.load_state_dict(latest["actor"])
                 agent.encoders.load_state_dict(latest["encoders"])
                 agent.critic.load_state_dict(latest["critic"])
-                agent.lang_encoder.load_state_dict(latest["lang_encoder"])
+                if agent.lang_encoder is not None and latest["lang_encoder"] is not None:
+                    agent.lang_encoder.load_state_dict(latest["lang_encoder"])
                 # print("[collector] rollout actor updated #########################" )
 
 
@@ -727,33 +824,42 @@ def collector_loop(
             while not episode_done and global_step <= cfg.algo.total_timesteps and (not stop_event.is_set()) and len(episode_steps)<cfg.send_transitions_len:
                 if cfg.eval_first and global_step == 0 and not initial_eval_completed:
                     # 在训练开始前先 eval 一次，看看 base policy 的表现
-                    with training_timer.time("evaluation"):
-                        eval_metrics = run_franka_evaluation(
-                            env=base_policy,  ## todo eval?
-                            agent=agent,
-                            eval_num_episode=cfg.eval_num_episodes,
-                            device=device,
-                            global_step=global_step,
-                            save_video=cfg.save_video,
-                            save_q_plots=cfg.save_video,  # Enable Q-plots when video saving is enabled
-                            run_name=run_name,
-                            output_dir=outputs_dir,
-                            lang_cfg = lang_cfg,
-                            lang_embedder= lang_embedder,
-                            chunk_len=cfg.chunk_len,  ##################
+                    pre_eval_task_success_stats = copy.deepcopy(
+                        base_policy.task_reward_generator.task_success_stats
+                    )
+                    try:
+                        with training_timer.time("evaluation"):
+                            eval_metrics = run_franka_evaluation(
+                                env=base_policy,  ## todo eval?
+                                agent=agent,
+                                eval_num_episode=cfg.eval_num_episodes,
+                                device=device,
+                                global_step=global_step,
+                                save_video=cfg.save_video,
+                                save_q_plots=cfg.save_video,  # Enable Q-plots when video saving is enabled
+                                run_name=run_name,
+                                output_dir=outputs_dir,
+                                lang_cfg = lang_cfg,
+                                lang_embedder= lang_embedder,
+                                chunk_len=cfg.chunk_len,  ##################
+                            )
+
+                            _print_eval_success_rates(eval_metrics)
+                    finally:
+                        base_policy.task_reward_generator.restore_task_success_stats(
+                            pre_eval_task_success_stats
                         )
-    
-                        _print_eval_success_rates(eval_metrics)
                     obs, task_prompt = base_policy.reset(evaluate_previous=False)
-                    task_emb = lang_embedder(task_prompt)
+                    task_emb = lang_embedder(task_prompt) if lang_embedder is not None else None
                     obs = _attach_task_emb(obs, task_emb)
                     episode_task_prompt = task_prompt
                     initial_eval_completed = True
+                    previous_residual_last = None
                     
                 with torch.no_grad(), utils.eval_mode(agent):
                     # print("cfg.algo.stddev_schedule:", cfg.algo.stddev_schedule)  # 0.003
                     stddev = utils.schedule(cfg.algo.stddev_schedule, global_step)
-                    # print("stddev:", stddev)  # 0.0030000000000000005
+                    print("stddev:", stddev)  # 0.0030000000000000005
                     # Attach the base-action chunk (H*dim) so actor/critic see chunk-level base.
                     obs["observation.base_action"] = base_policy.current_base_chunk(cfg.chunk_len)  ##################
                     obs_act = process_image_batch(copy.deepcopy(obs), image_keys, enc_type, rb=False)
@@ -770,10 +876,21 @@ def collector_loop(
                 # BasePolicy returns a per-step base action (m,), but a chunk
                 # transition requires next_obs to contain the next H*m chunk.
                 next_obs["observation.base_action"] = base_policy.current_base_chunk(cfg.chunk_len)
+
+                # The replayed transition carries the actually issued previous
+                # residual boundary. Episode/task resets deliberately break the
+                # chain so the first chunk is excluded from the boundary loss.
+                info = dict(info)
+                info["has_prev_residual"] = previous_residual_last is not None
+                info["prev_residual_last"] = previous_residual_last
+                current_residual = info["residual_action"].detach().reshape(
+                    -1, info["residual_action"].shape[-1]
+                )
+                previous_residual_last = current_residual[-1].clone()
                 
                 if done:
                     task_prompt = info["task_prompt"]
-                    task_emb = lang_embedder(task_prompt)
+                    task_emb = lang_embedder(task_prompt) if lang_embedder is not None else None
                 next_obs = _attach_task_emb(next_obs, task_emb)
                 if done.any():
                     episode_count += done.float().sum().item()
@@ -784,6 +901,7 @@ def collector_loop(
                         completed_task=episode_task_prompt,
                         succeeded=terminal_reward > 0.5,
                     )
+                    previous_residual_last = None
 
                     # Reward is sparse/terminal -> only log it at episode end.
                     _log = {"training/reward": terminal_reward}  ##################
@@ -823,27 +941,40 @@ def collector_loop(
             print(f"[collector] pushed episode {episode_idx}, len={len(episode_steps)}, global_step={global_step}")
 
             episode_idx += 1
-            if global_step % cfg.eval_interval_every_steps == 0 and ( global_step > 0):
-                with training_timer.time("evaluation"):
-                    eval_metrics = run_franka_evaluation(
-                        env=base_policy,  ## todo eval?
-                        agent=agent,
-                        eval_num_episode=cfg.eval_num_episodes,
-                        device=device,
-                        global_step=global_step,
-                        save_video=cfg.save_video,
-                        save_q_plots=cfg.save_video,  # Enable Q-plots when video saving is enabled
-                        run_name=run_name,
-                        output_dir=outputs_dir,
-                        lang_cfg = lang_cfg,
-                        lang_embedder= lang_embedder,
-                        chunk_len=cfg.chunk_len,  ##################
-                    )
+            periodic_eval_due = (
+                global_step > 0
+                and global_step % cfg.eval_interval_every_steps == 0
+            )
+            if periodic_eval_due:
+                pre_eval_task_success_stats = copy.deepcopy(
+                    base_policy.task_reward_generator.task_success_stats
+                )
+                try:
+                    with training_timer.time("evaluation"):
+                        eval_metrics = run_franka_evaluation(
+                            env=base_policy,  ## todo eval?
+                            agent=agent,
+                            eval_num_episode=cfg.eval_num_episodes,
+                            device=device,
+                            global_step=global_step,
+                            save_video=cfg.save_video,
+                            save_q_plots=cfg.save_video,  # Enable Q-plots when video saving is enabled
+                            run_name=run_name,
+                            output_dir=outputs_dir,
+                            lang_cfg = lang_cfg,
+                            lang_embedder= lang_embedder,
+                            chunk_len=cfg.chunk_len,  ##################
+                        )
 
-                    _print_eval_success_rates(eval_metrics)
+                        _print_eval_success_rates(eval_metrics)
+                finally:
+                    base_policy.task_reward_generator.restore_task_success_stats(
+                        pre_eval_task_success_stats
+                    )
                 obs, task_prompt = base_policy.reset(evaluate_previous=False)
-                task_emb = lang_embedder(task_prompt)
+                task_emb = lang_embedder(task_prompt) if lang_embedder is not None else None
                 obs = _attach_task_emb(obs, task_emb)
+                previous_residual_last = None
             # 原来 eval 后会 reset，这里 episode 结束也 reset
             # obs = base_policy.reset()
             
@@ -869,6 +1000,7 @@ def learner_loop(
         model_save_dir,
         run_name,
         task_output_root,
+        task_success_stats,
         online_cache_dir,
         online_cache_meta,
         online_cache_hash,
@@ -899,7 +1031,8 @@ def learner_loop(
             "actor": {k: v.detach().cpu() for k, v in agent.actor.state_dict().items()},
             "encoders": {k: v.detach().cpu() for k, v in agent.encoders.state_dict().items()},
             "critic": {k: v.detach().cpu() for k, v in agent.critic.state_dict().items()},
-            "lang_encoder": {k: v.detach().cpu() for k, v in agent.lang_encoder.state_dict().items()}
+            "lang_encoder": ({k: v.detach().cpu() for k, v in agent.lang_encoder.state_dict().items()}
+                             if agent.lang_encoder is not None else None)
         })
 
         def _publish_latest_actor():
@@ -907,7 +1040,8 @@ def learner_loop(
                 "actor": {k: v.detach().cpu() for k, v in agent.actor.state_dict().items()},
                 "encoders": {k: v.detach().cpu() for k, v in agent.encoders.state_dict().items()},
                 "critic": {k: v.detach().cpu() for k, v in agent.critic.state_dict().items()},
-                "lang_encoder": {k: v.detach().cpu() for k, v in agent.lang_encoder.state_dict().items()}
+                "lang_encoder": ({k: v.detach().cpu() for k, v in agent.lang_encoder.state_dict().items()}
+                                 if agent.lang_encoder is not None else None)
             }
             # 保持 queue 里尽量只有最新
             try:
@@ -978,6 +1112,16 @@ def learner_loop(
             #     continue
             if not got_episode:
                 time.sleep(0.01)
+                continue
+
+            # Checkpoints do not currently embed the online replay buffer. If
+            # its separate cache is empty on resume, wait for the collector to
+            # add data instead of sampling empty TorchRL storage.
+            if online_batch_size > 0 and len(online_rb) == 0:
+                print(
+                    "[learner] online replay buffer is empty; waiting for "
+                    "collector transitions before updating."
+                )
                 continue
             # --------------------------------------------------------------
             # (B) Updates
@@ -1051,6 +1195,14 @@ def learner_loop(
                     "training/global_step": global_step,
                     "training/episode_count": episode_count,
                     "buffer/online_size": len(online_rb),
+                    "buffer/online_size_chunks": len(online_rb),
+                    "buffer/online_size_steps": len(online_rb) * cfg.chunk_len,
+                    "buffer/online_capacity_chunks": max(
+                        1, cfg.algo.buffer_size // cfg.chunk_len
+                    ),
+                    "buffer/online_capacity_steps": max(
+                        1, cfg.algo.buffer_size // cfg.chunk_len
+                    ) * cfg.chunk_len,
                     "buffer/offline_size": len(offline_rb) if offline_rb else 0,
                     "timing/training_total_time": time.time() - train_start_time,
                     "timing/aggregate_steps_per_second": global_step / (time.time() - train_start_time),
@@ -1094,6 +1246,7 @@ def learner_loop(
                 save_training_checkpoint(
                     ckpt_path=ckpt_path,
                     agent=agent,
+                    online_rb=online_rb,
                     global_step=global_step,
                     best_eval_success_rate=best_eval_success_rate,
                     training_cum_time=training_cum_time,
@@ -1101,7 +1254,9 @@ def learner_loop(
                     actor_updates=actor_updates,
                     run_name=run_name,
                     task_output_root=task_output_root,
+                    task_success_stats=task_success_stats,
                     cfg=cfg,
+                    save_replay_buffer=cfg.save_replay_on_checkpoint,
                 )
 
             if global_step >= cfg.algo.total_timesteps and episode_queue.empty():
@@ -1120,6 +1275,16 @@ def main(cfg: ResidualTD3DexmgConfig):
     device = torch.device(device_str)
     enc_type=cfg.agent.enc_type
 
+    if cfg.rl_token.enabled and cfg.rl_token.offline_num_episodes is not None:
+        if cfg.rl_token.offline_num_episodes <= 0:
+            raise ValueError("rl_token.offline_num_episodes must be positive or null")
+        cfg.offline_data.num_episodes = cfg.rl_token.offline_num_episodes
+        print(
+            "RL-token offline subset enabled: "
+            f"using {cfg.offline_data.num_episodes} episode(s) for embedding collection, "
+            "VAE training, and offline replay construction"
+        )
+
     # Enable performance optimizations
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
@@ -1130,7 +1295,7 @@ def main(cfg: ResidualTD3DexmgConfig):
     # Load the behaviour-cloning policy that will serve as the "base" policy
     # for residual learning.
     # ---------------------------------------------------------------------
-    assert "base_policy" in cfg, "Base policy configuration is required"
+    assert getattr(cfg, "base_policy", None) is not None, "Base policy configuration is required"
 
 
     # Load dataset and get normalization functions early
@@ -1173,7 +1338,21 @@ def main(cfg: ResidualTD3DexmgConfig):
         min_std=cfg.offline_data.min_state_std,
         device=device,
     )
-    base_policy = BasePolicy(main_host="127.0.0.1", main_port=8008, action_scaler= action_scaler, state_standardizer=state_standardizer) # todo
+    base_policy = BasePolicy(
+        main_host="127.0.0.1",
+        main_port=8008,
+        action_scaler=action_scaler,
+        state_standardizer=state_standardizer,
+        # RL-token embedding/VAE/offline replay stages use dataset images only.
+        # Hardware is connected immediately before online warmup/rollout.
+        connect_robot=not cfg.rl_token.enabled,
+        save_images=cfg.save_images,
+    )
+    print(
+        "Image artifact saving: "
+        f"{'enabled' if cfg.save_images else 'disabled'} "
+        "(evaluation/train/warmup)"
+    )
 
 
     # ---------------------------------------------------------------------
@@ -1227,6 +1406,7 @@ def main(cfg: ResidualTD3DexmgConfig):
     per_step_dim = 8
     chunk_len = cfg.chunk_len
     action_dim = per_step_dim * chunk_len  # actor/critic act_dim = chunk_len * per_step_dim
+    cfg.agent.action_chunk_len = chunk_len
     # n-step is accumulated OVER CHUNKS, so bootstrap discount is gamma**H.
     gamma_chunk = cfg.algo.gamma ** chunk_len
     # Buffer/learning_starts counters are in STEP units; convert to chunk counts.
@@ -1253,10 +1433,95 @@ def main(cfg: ResidualTD3DexmgConfig):
         dataset_task_prompts = {}
         lowdim_keys = ["observation.state", "observation.base_action"]
 
+    # RL-Token stages must finish before any replay-cache lookup: old image
+    # buffers and buffers produced by a different bottleneck are incompatible.
+    offline_rl_tokens = None
+    rl_token_id = None
+    if cfg.rl_token.enabled:
+        dataset_task_prompts = _load_lerobot_task_prompts(dataset, cfg.offline_data.name)
+        rl_token_id = artifact_id(cfg.offline_data.name, cfg.offline_data.num_episodes, cfg.rl_token)
+        artifact_root = _CACHE_ROOT / cfg.rl_token.embedding_cache_dir / rl_token_id
+        if cfg.offline_data.num_episodes is None:
+            expected_embedding_frames = dataset.meta.total_frames
+        else:
+            expected_embedding_frames = sum(
+                dataset.meta.episodes[ep_idx]["length"]
+                for ep_idx in range(min(cfg.offline_data.num_episodes, dataset.meta.total_episodes))
+            )
+        embedding_store = initialize_embedding_store(
+            artifact_root,
+            expected_embedding_frames,
+            cfg.rl_token.embedding_storage_dtype,
+            reset=cfg.rl_token.force_recollect_embeddings,
+        )
+        print(
+            f"Loaded disk embedding store: {len(embedding_store)}/{expected_embedding_frames} "
+            f"frames, complete={embedding_store.complete}"
+        )
+        if not embedding_store.complete:
+            loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
+            resume_index = len(embedding_store)
+            shard_embeddings, shard_masks, shard_episode_ids = [], [], []
+            completed = False
+            progress = tqdm(
+                total=expected_embedding_frames,
+                initial=resume_index,
+                desc="Collecting frozen pi0 embeddings",
+            )
+            try:
+                for sample_index, sample in enumerate(loader):
+                    if sample_index < resume_index:
+                        continue
+                    ep_idx = int(sample["episode_index"].item())
+                    if cfg.offline_data.num_episodes is not None and ep_idx >= cfg.offline_data.num_episodes:
+                        break
+                    raw_obs = {k: sample[k].to(device) for k in sample if any(
+                        name in k for name in ("exterior_image_1_left", "exterior_image_2_left",
+                                               "wrist_image_left", "eef_position", "gripper_position")
+                    )}
+                    task_idx = int(sample["task_index"].item())
+                    embedding, mask = base_policy.get_offline_vla_embedding(
+                        raw_obs, dataset_task_prompts[task_idx]
+                    )
+                    shard_embeddings.append(embedding.cpu())
+                    shard_masks.append(mask.cpu())
+                    shard_episode_ids.append(ep_idx)
+                    progress.update(1)
+                    if len(shard_embeddings) >= cfg.rl_token.embedding_shard_size:
+                        embedding_store = append_embedding_shard(
+                            artifact_root, shard_embeddings, shard_masks, shard_episode_ids
+                        )
+                        shard_embeddings, shard_masks, shard_episode_ids = [], [], []
+                completed = len(embedding_store) + len(shard_embeddings) == expected_embedding_frames
+            finally:
+                progress.close()
+                embedding_store = append_embedding_shard(
+                    artifact_root,
+                    shard_embeddings,
+                    shard_masks,
+                    shard_episode_ids,
+                    complete=completed,
+                )
+            if not completed:
+                raise RuntimeError(
+                    f"Embedding collection stopped at {len(embedding_store)}/{expected_embedding_frames} frames"
+                )
+        rl_token_id = bottleneck_id(rl_token_id, cfg.rl_token)
+        bottleneck_root = _CACHE_ROOT / cfg.rl_token.checkpoint_dir / rl_token_id
+        rl_token_encoder = train_or_load_rl_token(embedding_store, cfg.rl_token, bottleneck_root, device)
+        # Do not eagerly encode the complete offline dataset here.  The
+        # serialized replay buffer already contains ``observation.rl_token``;
+        # when that buffer cache exists, encoding every VLA embedding again is
+        # both redundant and expensive.  ``offline_rl_tokens`` is populated
+        # lazily below only when the replay-buffer cache misses.
+        base_policy.set_rl_token_encoder(rl_token_encoder, cfg.rl_token.obs_key)
+        image_keys = [cfg.rl_token.obs_key]
+        lowdim_keys = ["observation.state", "observation.base_action"]
+
     # ---------------------------------------------------------------------
     # Networks ------------------------------------------------------------
     # ---------------------------------------------------------------------
-    agent = QAgentLang(
+    agent = _make_agent(cfg,
         obs_shape=(img_c, img_h, img_w),
         prop_shape=(lowdim_dim,),
         action_dim=action_dim,
@@ -1326,7 +1591,15 @@ def main(cfg: ResidualTD3DexmgConfig):
         # v2 guarantees that both obs and next_obs store H*m base-action chunks.
         # Bumping this schema also prevents loading older malformed caches whose
         # next observation still contained a single m-dimensional action.
-        "storage": "chunk_v2_next_base_chunk",
+        # v3 also guarantees RL tokens are stored as (token_dim,) per
+        # transition. v2 online caches accidentally retained only token[0].
+        "storage": "chunk_v4_prev_residual_boundary",
+        "temporal_boundary_context": "prev_residual_last_v1",
+        "gripper_filter": {
+            "close_threshold": base_policy.args.gripper_close_threshold,
+            "open_threshold": base_policy.args.gripper_open_threshold,
+            "confirm_steps": base_policy.args.gripper_confirm_steps,
+        },
         "horizon": horizon,
         "size": cfg.algo.learning_starts,
         "sampling_strategy": cfg.algo.sampling_strategy,
@@ -1361,26 +1634,54 @@ def main(cfg: ResidualTD3DexmgConfig):
         online_cache_dir = dl_dir
 
     loaded_online_from_cache = False
-    if online_cache_dir.exists():
+    resume_checkpoint = getattr(cfg, "resume_checkpoint", None)
+    expected_replay_dir = None
+    if resume_checkpoint:
+        resume_checkpoint_path = Path(resume_checkpoint)
+        expected_replay_dir = (
+            resume_checkpoint_path.parent
+            / f"{resume_checkpoint_path.stem}_replay"
+            / "online_rb"
+        )
+    exact_replay_resume = bool(
+        getattr(cfg, "resume", False)
+        and cfg.save_replay_on_checkpoint
+        and expected_replay_dir is not None
+        and expected_replay_dir.exists()
+    )
+    if exact_replay_resume:
+        print(
+            "Exact checkpoint resume requested; skipping the generic online "
+            "cache and loading the checkpoint-matched replay buffer later."
+        )
+    elif online_cache_dir.exists():
         print(f"{online_cache_dir} found on disk. Attempting to load...")
         online_rb.sampler._empty()
         optimized_replay_buffer_loads(online_rb, online_cache_dir)
-        loaded_online_from_cache = True
-        print(f"Loaded online buffer from cache at {online_cache_dir} (size={len(online_rb)})")
+        loaded_online_from_cache = len(online_rb) > 0
+        if loaded_online_from_cache:
+            print(f"Loaded online buffer from cache at {online_cache_dir} (size={len(online_rb)})")
+        else:
+            print(
+                f"Online buffer cache at {online_cache_dir} is empty; "
+                "waiting for newly collected transitions before training."
+            )
 
-    # Offline data is required for normalization, but can be unused for training if offline_fraction=0
-    assert cfg.offline_data is not None and cfg.offline_data.num_episodes is not None
+    # Offline data is required for normalization. A null num_episodes means
+    # use every episode in the dataset.
+    assert cfg.offline_data is not None
 
     # Dataset and normalization already loaded above - use existing dataset
 
     # Use actual dataset metadata for precise buffer sizing
     if cfg.offline_data.num_episodes is not None:
         # Only use subset of episodes if specified
+        selected_episode_count = min(cfg.offline_data.num_episodes, dataset.meta.total_episodes)
         total_frames = sum(
             dataset.meta.episodes[ep_idx]["length"]
-            for ep_idx in range(min(cfg.offline_data.num_episodes, dataset.meta.total_episodes))
+            for ep_idx in range(selected_episode_count)
         )
-        num_episodes = cfg.offline_data.num_episodes
+        num_episodes = selected_episode_count
     else:
         # Use entire dataset
         total_frames = dataset.meta.total_frames
@@ -1468,12 +1769,26 @@ def main(cfg: ResidualTD3DexmgConfig):
         # episode_cache: dict[int, dict] = {}
         transitions = 0
         step_id = 0
+        previous_ep_idx = None
 
         for sample in tqdm(loader, desc="Processing offline dataset"):  # 用进度条逐样本处理
             ep_idx = int(sample["episode_index"].item())
             # if num_episodes is not None and ep_idx == num_episodes:
             if num_episodes is not None and ep_idx >= num_episodes:  ##################
                 break
+
+            if previous_ep_idx is None or ep_idx != previous_ep_idx:
+                if use_base_policy_for_base_actions:
+                    stale_actions = len(base_policy.base_action_buffer)
+                    base_policy.base_action_buffer.clear()
+                    base_policy._last_base_action = None
+                    base_policy._last_rl_token = None
+                    base_policy.pi05_client.reset()
+                    print(
+                        f"[offline episode {ep_idx}] cleared {stale_actions} buffered "
+                        "base action(s)"
+                    )
+                previous_ep_idx = ep_idx
 
             # ------------------------------------------------------------------
             # Build observation and action directly for replay buffer ----------
@@ -1530,6 +1845,11 @@ def main(cfg: ResidualTD3DexmgConfig):
                 "reward": float(done_flag),         # sparse terminal reward
                 "done": done_flag,
             }
+            if cfg.rl_token.enabled:
+                if offline_rl_tokens is None or step_id >= len(offline_rl_tokens):
+                    raise IndexError("RL-token cache is shorter than the offline dataset")
+                frame[cfg.rl_token.obs_key] = offline_rl_tokens[step_id]
+                step_id += 1
             img = {}
             ##################
 
@@ -1540,6 +1860,8 @@ def main(cfg: ResidualTD3DexmgConfig):
             #     "observation.base_action": base_action_scaled,
             # }
             for k in image_keys:
+                if cfg.rl_token.enabled:
+                    continue
                 raw_k = k.replace("observation.images.", "")
             #     curr_obs[k] = sample[raw_k].squeeze(0)
             # curr_obs = process_image_batch(curr_obs, image_keys, enc_type, rb=True)  ###
@@ -1547,10 +1869,12 @@ def main(cfg: ResidualTD3DexmgConfig):
             # to_uint8(curr_obs, image_keys)
                 ##################
                 img[k] = sample[raw_k].squeeze(0)
-            img = process_image_batch(img, image_keys, enc_type, rb=True)  ###
-            to_uint8(img, image_keys)
+            if not cfg.rl_token.enabled:
+                img = process_image_batch(img, image_keys, enc_type, rb=True)  ###
+                to_uint8(img, image_keys)
             for k in image_keys:
-                frame[k] = img[k]
+                if not cfg.rl_token.enabled:
+                    frame[k] = img[k]
                 ##################
 
             # Inject task embedding from the dataset's per-frame task_index.
@@ -1639,6 +1963,12 @@ def main(cfg: ResidualTD3DexmgConfig):
                 base_chunk = torch.stack([frames[i]["base"] for i in idxs], dim=0).reshape(-1)     # (H*m,)
                 action_chunk = torch.stack([frames[i]["gt"] for i in idxs], dim=0).reshape(-1)     # (H*m,)
                 next_base_chunk = torch.stack([frames[i]["base"] for i in nidxs], dim=0).reshape(-1)
+                has_prev_residual = t > 0 and not frames[t - 1]["done"]
+                prev_residual_last = (
+                    frames[t - 1]["gt"] - frames[t - 1]["base"]
+                    if has_prev_residual
+                    else torch.zeros_like(frames[t]["gt"])
+                )
                 R = sum((cfg.algo.gamma ** h) * frames[t + h]["reward"] for h in range(n))
                 cur_obs = {"observation.state": frames[t]["state"], "observation.base_action": base_chunk}
                 next_obs = {"observation.state": frames[nt]["state"], "observation.base_action": next_base_chunk}
@@ -1660,6 +1990,10 @@ def main(cfg: ResidualTD3DexmgConfig):
                                 "reward": torch.tensor(float(R), dtype=torch.float32),
                             },
                             batch_size=[],
+                        ),
+                        "prev_residual_last": prev_residual_last,
+                        "has_prev_residual": torch.tensor(
+                            has_prev_residual, dtype=torch.bool
                         ),
                         "_priority": torch.tensor(10.0, dtype=torch.float32),  # High initial priority for new samples
                     },
@@ -1690,7 +2024,14 @@ def main(cfg: ResidualTD3DexmgConfig):
         "gamma": cfg.algo.gamma,
         "chunk_len": chunk_len,  ##################
         "gamma_chunk": gamma_chunk,  ##################
-        "storage": "chunk_v1",  ################## # chunk macro-transition format; never mix with per-step caches
+        "storage": "chunk_v2_prev_residual_boundary",
+        "temporal_boundary_context": "prev_residual_last_v1",
+        "gripper_filter": {
+            "close_threshold": base_policy.args.gripper_close_threshold,
+            "open_threshold": base_policy.args.gripper_open_threshold,
+            "confirm_steps": base_policy.args.gripper_confirm_steps,
+        },
+        "rl_token_artifact": rl_token_id,
         "base_policy_wandb_id": cfg.base_policy.wandb_id,
         "sampling_strategy": cfg.algo.sampling_strategy,
         "normalized_actions": True,
@@ -1733,6 +2074,12 @@ def main(cfg: ResidualTD3DexmgConfig):
             print(f"Loaded offline buffer from cache at {cache_dir} (size={len(offline_rb)})")
 
         if not loaded_from_cache:
+            if cfg.rl_token.enabled:
+                # A newly constructed buffer stores the compact RL token in
+                # each observation (and next observation).  Persisting that
+                # buffer makes subsequent runs independent of this full-dataset
+                # encoding pass.
+                offline_rl_tokens = encode_all(rl_token_encoder, embedding_store, device)
             added = _populate_offline_buffer(
                 dataset=dataset,
                 rb=offline_rb,
@@ -1757,6 +2104,13 @@ def main(cfg: ResidualTD3DexmgConfig):
             added = len(offline_rb)
     else:
         print("Skipping offline buffer population for online-only training")
+
+    if cfg.rl_token.enabled:
+        print(
+            "RL-token offline stages complete; connecting Franka and the ZED "
+            "reward camera for online rollout..."
+        )
+        base_policy.connect_online_resources(required=True)
     
     # ------------------------------------------------------------------
     # Warm-up phase (random policy) --------------------------------------
@@ -1776,7 +2130,7 @@ def main(cfg: ResidualTD3DexmgConfig):
         # task_prompt = task_one
         # task_emb = lang_embedder(task_prompt)
         obs, task_prompt = base_policy.reset()
-        task_emb = lang_embedder(task_prompt)
+        task_emb = lang_embedder(task_prompt) if lang_embedder is not None else None
         obs = _attach_task_emb(obs= obs,task_emb=task_emb)
         # --------------------------------------------------------------
         # Logging helper: print progress every 1 000 collected transitions
@@ -1835,7 +2189,7 @@ def main(cfg: ResidualTD3DexmgConfig):
 
             # print(f"[warmup] after step: reward={reward}, done={done}")
             task_prompt = info["task_prompt"]
-            task_emb = lang_embedder(task_prompt)
+            task_emb = lang_embedder(task_prompt) if lang_embedder is not None else None
             next_obs = _attach_task_emb(next_obs, task_emb)
             reward_sum += reward.sum().item()
             episode_count += done.float().sum().item()
@@ -1905,7 +2259,9 @@ def main(cfg: ResidualTD3DexmgConfig):
         resume_state = load_training_checkpoint(
             ckpt_path=cfg.resume_checkpoint,
             agent=agent,
+            online_rb=online_rb,
             device=device,
+            load_replay_buffer=cfg.save_replay_on_checkpoint,
         )
 
         global_step = resume_state["global_step"]
@@ -1927,6 +2283,20 @@ def main(cfg: ResidualTD3DexmgConfig):
                 "Checkpoint has no task_output_root; using a new task artifact "
                 f"directory: {base_policy.task_reward_generator.output_root}"
             )
+
+        saved_task_stats = resume_state.get("task_success_stats")
+        if cfg.algo.reset_task_success_rates_on_restart:
+            print("Task success rates reset to 0.5 after restart.")
+        elif saved_task_stats is None:
+            print(
+                "Checkpoint has no task_success_stats; task success rates "
+                "remain initialized at 0.5."
+            )
+        else:
+            base_policy.task_reward_generator.restore_task_success_stats(
+                saved_task_stats
+            )
+            print("Restored per-task success rates from checkpoint.")
 
     base_policy.task_reward_generator.output_root.mkdir(parents=True, exist_ok=True)
 
@@ -1972,7 +2342,7 @@ def main(cfg: ResidualTD3DexmgConfig):
         )
         run_name = f"{run_name}__from_step{global_step}"
 
-    _wandb_config = OmegaConf.to_container(cfg, resolve=True)
+    _wandb_config = _config_to_container(cfg)
     # Remove notes from config if present
     assert isinstance(_wandb_config, dict)
     _wandb_config["wandb"].pop("notes", None)
@@ -2010,12 +2380,46 @@ def main(cfg: ResidualTD3DexmgConfig):
     # Log horizon to wandb summary
     # wandb.summary["environment/horizon"] = env.vec_env.metadata["horizon"]
 
-    # Create a timestamped folder in CACHE_DIR for all outputs
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    run_cache_dir = _CACHE_ROOT / f"run_{timestamp}_{run_name}"
+    # A fresh run gets one timestamped directory. Exact resume reuses the run
+    # directory containing the selected checkpoint so checkpoints and outputs
+    # remain in one place across process restarts.
+    reuse_run_dir = bool(
+        resume_state is not None
+        and cfg.reuse_run_dir_on_resume
+        and getattr(cfg, "resume_checkpoint", None)
+    )
+    if reuse_run_dir:
+        resume_ckpt_path = Path(cfg.resume_checkpoint).expanduser().resolve()
+        model_save_dir = resume_ckpt_path.parent
+        if model_save_dir.name != "models":
+            raise ValueError(
+                "resume_checkpoint must be inside a models/ directory when "
+                "reuse_run_dir_on_resume=True; got "
+                f"{resume_ckpt_path}"
+            )
+        run_cache_dir = model_save_dir.parent
 
-    # Create subdirectories for models and outputs
-    model_save_dir = run_cache_dir / "models"
+        checkpoint_steps = []
+        for candidate in model_save_dir.glob("checkpoint_*.pt"):
+            try:
+                checkpoint_steps.append(int(candidate.stem.removeprefix("checkpoint_")))
+            except ValueError:
+                continue
+        newer_steps = [step for step in checkpoint_steps if step > global_step]
+        if newer_steps:
+            raise RuntimeError(
+                f"Refusing in-place resume from step {global_step}: run directory "
+                f"already contains newer checkpoint step {max(newer_steps)}. "
+                "Resume the latest checkpoint or set "
+                "reuse_run_dir_on_resume=False to create a separate directory."
+            )
+        print(f"Reusing original run directory: {run_cache_dir}")
+    else:
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        run_cache_dir = _CACHE_ROOT / f"run_{timestamp}_{run_name}"
+        model_save_dir = run_cache_dir / "models"
+
+    # Create subdirectories for models and outputs.
     outputs_dir = run_cache_dir / "outputs"
     model_save_dir.mkdir(parents=True, exist_ok=True)
     outputs_dir.mkdir(parents=True, exist_ok=True)
@@ -2156,6 +2560,7 @@ def main(cfg: ResidualTD3DexmgConfig):
                     model_save_dir,
                     run_name,
                     str(base_policy.task_reward_generator.output_root),
+                    base_policy.task_reward_generator.task_success_stats,
                     online_cache_dir,
                     online_cache_meta,
                     online_cache_hash,
@@ -2171,8 +2576,8 @@ def main(cfg: ResidualTD3DexmgConfig):
     
     print(f"Training finished in {time.time() - train_start_time:.2f} seconds.")
 
-    # Clean up entire run directory after successful completion (videos/logs are saved to wandb)
-    if run_cache_dir.exists():
+    # Preserve checkpoints by default so this run remains resumable.
+    if cfg.cleanup_run_dir_on_finish and run_cache_dir.exists():
         print(f"Cleaning up run directory: {run_cache_dir}")
         shutil.rmtree(run_cache_dir)
         print("Run directory cleaned up successfully.")

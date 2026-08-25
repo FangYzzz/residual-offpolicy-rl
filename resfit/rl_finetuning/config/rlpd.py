@@ -125,7 +125,7 @@ class ActorConfig:
     scale_head_max: float = 1.0 * 0.1
     scale_head_init_value: float = 0.01
     scale_head_per_dim: bool = True
-    scale_head_enabled: bool = True  ### True
+    scale_head_enabled: bool = False  ### True
 
 @dataclass
 class QAgentConfig:
@@ -149,6 +149,14 @@ class QAgentConfig:
     # gradient clipping
     critic_grad_clip_norm: float = 1.0
     actor_grad_clip_norm: float = 0.1 # 1.0
+
+    # Temporal regularization for flattened action chunks. The trainer sets
+    # action_chunk_len from its top-level chunk_len before constructing agents.
+    action_chunk_len: int = 1
+    executed_residual_dims: int = 3
+    temporal_smoothness_dims: int = 3
+    temporal_smoothness_intra_weight: float = 0 # 0.001
+    temporal_smoothness_boundary_weight: float = 0 # 0.001
 
     # bc loss regularization
     bc_loss_coef: float = 0.0
@@ -314,7 +322,7 @@ class RLPDDexmgConfig:
     task: str = "Can"
     num_envs: int = 1
     eval_num_envs: int = 8
-    eval_num_episodes: int = 2 #20  # 50
+    eval_num_episodes: int = 20 # 20  # 50
     headless: bool = True
     video_key: str = "observation.images.agentview"
     rl_camera: List[str] = field(

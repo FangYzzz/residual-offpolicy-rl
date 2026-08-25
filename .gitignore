@@ -12,3 +12,5 @@ deps/
 **/.env
 *.png
 debug_images/
+rl_token_checkpoints/
+vla_embedding_cache/

@@ -1,4 +1,4 @@
-# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.  
+"action": combined_chunk,  # combined action chunk (1, H*dim)# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.  
 
 # SPDX-License-Identifier: CC-BY-NC-4.0
 
@@ -35,7 +35,7 @@ import numpy as np
 import tensordict
 import torch
 import torchrl
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from omegaconf import OmegaConf
 from tensordict import TensorDict
 from torch.utils.data import DataLoader
@@ -44,15 +44,15 @@ from tqdm import tqdm
 import threading
 import queue
 import wandb
-from resfit.dexmg.environments.dexmg import create_vectorized_env
-from resfit.lerobot.policies.act.configuration_act import ACTConfig
-from resfit.lerobot.policies.act.modeling_act import ACTPolicy
-from resfit.lerobot.utils.load_policy import download_policy_from_wandb, load_policy
+# from resfit.dexmg.environments.dexmg import create_vectorized_env
+# from resfit.lerobot.policies.act.configuration_act import ACTConfig
+# from resfit.lerobot.policies.act.modeling_act import ACTPolicy
+# from resfit.lerobot.utils.load_policy import download_policy_from_wandb, load_policy
 from resfit.rl_finetuning.config.residual_td3 import ResidualTD3DexmgConfig
 from resfit.rl_finetuning.off_policy.common_utils import utils
 from resfit.rl_finetuning.off_policy.rl.q_agent_lang import QAgentLang
 from resfit.rl_finetuning.utils.dtype import to_uint8
-from resfit.rl_finetuning.utils.evaluate_dexmg import run_dexmg_evaluation
+# from resfit.rl_finetuning.utils.evaluate_dexmg import run_dexmg_evaluation
 from resfit.rl_finetuning.utils.evaluate_franka import run_franka_evaluation
 from resfit.rl_finetuning.utils.hugging_face import (
     _hf_download_buffer,
@@ -65,7 +65,7 @@ from resfit.rl_finetuning.config.rlpd import (
 )
 from resfit.rl_finetuning.utils.normalization import ActionScaler, StateStandardizer
 from resfit.rl_finetuning.utils.rb_transforms import MultiStepTransform
-from resfit.rl_finetuning.wrappers.residual_env_wrapper import BasePolicyVecEnvWrapper
+# from resfit.rl_finetuning.wrappers.residual_env_wrapper import BasePolicyVecEnvWrapper
 from gpt_residual_robot import BasePolicy
 
 # -----------------------------------------------------------------------------
@@ -706,7 +706,7 @@ def collector_loop(
                     eval_metrics = run_franka_evaluation(
                         env=base_policy,  ## todo eval?
                         agent=agent,
-                        num_episodes=cfg.eval_num_episodes,
+                        eval_num_episode=cfg.eval_num_episodes,
                         device=device,
                         global_step=global_step,
                         save_video=cfg.save_video,

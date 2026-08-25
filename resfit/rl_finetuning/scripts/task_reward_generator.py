@@ -565,12 +565,12 @@ class TaskRewardGenerator:
         # )
 
         response = self.client.responses.create(
-            model="gpt-4.1-mini", # gpt-4.1-mini
+            model="gpt-5.6-terra",
             input=[{
                 "role": "user",
                 "content": [
                     {"type": "input_text", "text": prompt_task},
-                    {"type": "input_image", "image_url": f"data:image/jpeg;base64,{scene}",},
+                    {"type": "input_image", "image_url": f"data:image/jpeg;base64,{scene}", "detail": "high"},
                 ],
             }],
         )
@@ -651,13 +651,13 @@ class TaskRewardGenerator:
         )   
 
         response = self.client.responses.create(
-            model="gpt-4.1-mini", # gpt-4.1-mini
+            model="gpt-5.6-terra",
             input=[{
                 "role": "user",
                 "content": [
                     {"type": "input_text", "text": prompt_reward},
-                    {"type": "input_image", "image_url": f"data:image/jpeg;base64,{current_scene_gdino}",},
-                    {"type": "input_image", "image_url": f"data:image/jpeg;base64,{next_scene_gdino}",},
+                    {"type": "input_image", "image_url": f"data:image/jpeg;base64,{current_scene_gdino}", "detail": "high"},
+                    {"type": "input_image", "image_url": f"data:image/jpeg;base64,{next_scene_gdino}", "detail": "high"},
                 ],
             }],
         )

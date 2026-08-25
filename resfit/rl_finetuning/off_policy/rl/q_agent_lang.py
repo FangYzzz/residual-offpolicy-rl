@@ -64,6 +64,27 @@ class QAgentLang(nn.Module):
         self.rl_cameras = rl_cameras
         self.cfg = cfg
         self.residual_actor = residual_actor
+        self.action_chunk_len = int(getattr(cfg, "action_chunk_len", 1))
+        if self.action_chunk_len < 1 or action_dim % self.action_chunk_len != 0:
+            raise ValueError(
+                f"action_dim={action_dim} must be divisible by "
+                f"action_chunk_len={self.action_chunk_len}"
+            )
+        self.per_step_action_dim = action_dim // self.action_chunk_len
+        self.executed_residual_dims = max(
+            0,
+            min(
+                int(getattr(cfg, "executed_residual_dims", 3)),
+                self.per_step_action_dim,
+            ),
+        )
+        self.temporal_smoothness_dims = max(
+            0,
+            min(
+                int(getattr(cfg, "temporal_smoothness_dims", 3)),
+                self.per_step_action_dim,
+            ),
+        )
 
         # ---- Hard Q-advantage residual gate ----
         # Adopt the combined (base + residual) action only where the critic judges it a
@@ -381,6 +402,8 @@ class QAgentLang(nn.Module):
             clip=1,  # clip
             use_target=False,
         )
+        if self.residual_actor:
+            action = self._mask_unexecuted_residual_dims(action)
 
         # Hard Q-advantage gate: keep the base action (residual -> 0) unless the
         # combined action is a clear improvement over the base action.
@@ -404,6 +427,15 @@ class QAgentLang(nn.Module):
         if cpu:
             action = action.cpu()
         return action
+
+    def _mask_unexecuted_residual_dims(self, residual: torch.Tensor) -> torch.Tensor:
+        """Match training and inference to the XYZ-only residual executed by BasePolicy."""
+        chunk = residual.reshape(
+            residual.shape[0], self.action_chunk_len, self.per_step_action_dim
+        )
+        mask = torch.zeros_like(chunk)
+        mask[..., : self.executed_residual_dims] = 1.0
+        return (chunk * mask).reshape_as(residual)
 
     def _act_default(
         self,
@@ -466,6 +498,10 @@ class QAgentLang(nn.Module):
                 clip=self.cfg.stddev_clip,
                 use_target=True,
             )
+            if self.residual_actor:
+                next_residual_action = self._mask_unexecuted_residual_dims(
+                    next_residual_action
+                )
 
             if self.residual_actor:
                 # Current step: 'action' from the replay buffer is the executed combined action
@@ -579,7 +615,45 @@ class QAgentLang(nn.Module):
 
         return metrics
 
-    def _compute_actor_loss(self, obs: dict[str, torch.Tensor], stddev: float):
+    def _temporal_smoothness_losses(
+        self,
+        action_pred: torch.Tensor,
+        prev_residual_last: torch.Tensor | None,
+        has_prev_residual: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return unweighted intra-chunk and cross-chunk residual MSE losses."""
+        residual_chunk = action_pred.reshape(
+            action_pred.shape[0], self.action_chunk_len, self.per_step_action_dim
+        )
+        smooth_dims = self.temporal_smoothness_dims
+
+        if self.action_chunk_len > 1 and smooth_dims > 0:
+            intra_delta = (
+                residual_chunk[:, 1:, :smooth_dims]
+                - residual_chunk[:, :-1, :smooth_dims]
+            )
+            intra_smoothness_loss = intra_delta.square().mean()
+        else:
+            intra_smoothness_loss = action_pred.new_zeros(())
+
+        boundary_smoothness_loss = action_pred.new_zeros(())
+        if prev_residual_last is not None and has_prev_residual is not None and smooth_dims > 0:
+            previous = prev_residual_last.to(action_pred.device).reshape(
+                action_pred.shape[0], -1
+            )[:, :smooth_dims]
+            valid = has_prev_residual.to(action_pred.device).reshape(-1).bool()
+            if valid.any():
+                boundary_delta = residual_chunk[:, 0, :smooth_dims] - previous
+                boundary_smoothness_loss = boundary_delta[valid].square().mean()
+        return intra_smoothness_loss, boundary_smoothness_loss
+
+    def _compute_actor_loss(
+        self,
+        obs: dict[str, torch.Tensor],
+        stddev: float,
+        prev_residual_last: torch.Tensor | None = None,
+        has_prev_residual: torch.Tensor | None = None,
+    ):
         assert "feat" in obs, "safety check"
 
         action_pred: torch.Tensor = self._act_default(
@@ -591,6 +665,8 @@ class QAgentLang(nn.Module):
             clip=self.cfg.stddev_clip,
             use_target=False,
         )
+        if self.residual_actor:
+            action_pred = self._mask_unexecuted_residual_dims(action_pred)
 
         # Add L2 regularization on action magnitude (before we add the residual action to the base)
         action_l2_penalty = self.cfg.actor.action_l2_reg_weight * torch.mean(torch.sum(action_pred**2, dim=-1))
@@ -605,9 +681,33 @@ class QAgentLang(nn.Module):
         q = self.critic.q_value_for_policy(obs["feat"], obs["observation.state"], combined_action)
         actor_loss_base = -q.mean()
 
-        actor_loss_total = actor_loss_base + action_l2_penalty
+        intra_smoothness_loss, boundary_smoothness_loss = (
+            self._temporal_smoothness_losses(
+                action_pred, prev_residual_last, has_prev_residual
+            )
+        )
 
-        return actor_loss_total, actor_loss_base, combined_action, action_pred, action_l2_penalty
+        intra_penalty = (
+            float(getattr(self.cfg, "temporal_smoothness_intra_weight", 0.0))
+            * intra_smoothness_loss
+        )
+        boundary_penalty = (
+            float(getattr(self.cfg, "temporal_smoothness_boundary_weight", 0.0))
+            * boundary_smoothness_loss
+        )
+        actor_loss_total = (
+            actor_loss_base + action_l2_penalty + intra_penalty + boundary_penalty
+        )
+
+        return (
+            actor_loss_total,
+            actor_loss_base,
+            combined_action,
+            action_pred,
+            action_l2_penalty,
+            intra_smoothness_loss,
+            boundary_smoothness_loss,
+        )
 
     def _compute_actor_bc_loss(self, batch, *, backprop_encoder):
         assert not self.residual_actor, "Not implemented"
@@ -648,7 +748,13 @@ class QAgentLang(nn.Module):
         loss = loss.sum(1).mean(0)
         return loss  # noqa: RET504
 
-    def update_actor(self, obs: dict[str, torch.Tensor], stddev: float):
+    def update_actor(
+        self,
+        obs: dict[str, torch.Tensor],
+        stddev: float,
+        prev_residual_last: torch.Tensor | None = None,
+        has_prev_residual: torch.Tensor | None = None,
+    ):
         metrics = {}
 
         # Compute actor loss and get the actions used (single actor call)
@@ -658,10 +764,22 @@ class QAgentLang(nn.Module):
             combined_action,
             action_pred,
             action_l2_penalty,
-        ) = self._compute_actor_loss(obs, stddev)
+            intra_smoothness_loss,
+            boundary_smoothness_loss,
+        ) = self._compute_actor_loss(
+            obs, stddev, prev_residual_last, has_prev_residual
+        )
 
         metrics["train/actor_loss_base"] = actor_loss_base.item()
         metrics["train/actor_loss_total"] = actor_loss_total.item()
+        metrics["train/actor_intra_chunk_smoothness_loss"] = intra_smoothness_loss.item()
+        metrics["train/actor_boundary_smoothness_loss"] = boundary_smoothness_loss.item()
+        metrics["train/actor_intra_chunk_smoothness_penalty"] = (
+            self.cfg.temporal_smoothness_intra_weight * intra_smoothness_loss
+        ).item()
+        metrics["train/actor_boundary_smoothness_penalty"] = (
+            self.cfg.temporal_smoothness_boundary_weight * boundary_smoothness_loss
+        ).item()
         # Store residual actions for logging (the actual residual component we want to monitor)
         metrics["_actions"] = action_pred.detach().cpu()
         # Also store combined actions if needed for other purposes
@@ -697,6 +815,8 @@ class QAgentLang(nn.Module):
         stddev: float,
         bc_batch,
         ref_agent: QAgent,
+        prev_residual_last: torch.Tensor | None = None,
+        has_prev_residual: torch.Tensor | None = None,
     ):
         metrics = {}
 
@@ -707,10 +827,22 @@ class QAgentLang(nn.Module):
             combined_action,
             action_pred,
             action_l2_penalty,
-        ) = self._compute_actor_loss(obs, stddev)
+            intra_smoothness_loss,
+            boundary_smoothness_loss,
+        ) = self._compute_actor_loss(
+            obs, stddev, prev_residual_last, has_prev_residual
+        )
 
         metrics["train/actor_loss_base"] = actor_loss_base.item()
         metrics["train/actor_loss_total"] = actor_loss_total.item()
+        metrics["train/actor_intra_chunk_smoothness_loss"] = intra_smoothness_loss.item()
+        metrics["train/actor_boundary_smoothness_loss"] = boundary_smoothness_loss.item()
+        metrics["train/actor_intra_chunk_smoothness_penalty"] = (
+            self.cfg.temporal_smoothness_intra_weight * intra_smoothness_loss
+        ).item()
+        metrics["train/actor_boundary_smoothness_penalty"] = (
+            self.cfg.temporal_smoothness_boundary_weight * boundary_smoothness_loss
+        ).item()
         # Store residual actions for logging (the actual residual component we want to monitor)
         metrics["_actions"] = action_pred.detach().cpu()
         # Also store combined actions if needed for other purposes
@@ -851,11 +983,25 @@ class QAgentLang(nn.Module):
             actor_obs = obs
             actor_obs["feat"] = actor_obs["feat"].detach()
 
+        prev_residual_last = batch.get("prev_residual_last", None)
+        has_prev_residual = batch.get("has_prev_residual", None)
         if bc_batch is None:
-            actor_metric = self.update_actor(actor_obs, stddev)
+            actor_metric = self.update_actor(
+                actor_obs,
+                stddev,
+                prev_residual_last=prev_residual_last,
+                has_prev_residual=has_prev_residual,
+            )
         else:
             assert ref_agent is not None
-            actor_metric = self.update_actor_rft(actor_obs, stddev, bc_batch, ref_agent)
+            actor_metric = self.update_actor_rft(
+                actor_obs,
+                stddev,
+                bc_batch,
+                ref_agent,
+                prev_residual_last=prev_residual_last,
+                has_prev_residual=has_prev_residual,
+            )
 
         utils.soft_update_params(self.actor, self.actor_target, self.cfg.critic_target_tau)
         metrics.update(actor_metric)

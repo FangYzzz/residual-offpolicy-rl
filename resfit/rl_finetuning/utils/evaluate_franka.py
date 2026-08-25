@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
 
 import imageio
@@ -268,6 +270,126 @@ def _attach_task_emb(obs, lang_cfg, task_emb):
                 return obs
             return _inject_task_emb(obs, task_emb, key=lang_cfg.lang_emb_obs_key)
 
+
+def _save_eval_progress(
+    path: Path,
+    *,
+    eval_step: int,
+    eval_num_episode: int,
+    chunk_len: int,
+    candidate_tasks: list[str],
+    successes_by_task: dict[str, list[bool]],
+    all_combined_trajs: list[np.ndarray],
+    all_residual_trajs: list[np.ndarray],
+    all_q_trajectories_by_task: dict[str, list[list[float]]],
+    status: str,
+) -> None:
+    """Atomically persist completed evaluation episodes as portable JSON."""
+    payload = {
+        "schema_version": 1,
+        "status": status,
+        "eval_step": int(eval_step),
+        "eval_num_episode": int(eval_num_episode),
+        "chunk_len": int(chunk_len),
+        "candidate_tasks": candidate_tasks,
+        "successes_by_task": successes_by_task,
+        "all_combined_trajs": [trajectory.tolist() for trajectory in all_combined_trajs],
+        "all_residual_trajs": [trajectory.tolist() for trajectory in all_residual_trajs],
+        "all_q_trajectories_by_task": all_q_trajectories_by_task,
+    }
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False)
+        handle.flush()
+        os.fsync(handle.fileno())
+    tmp_path.replace(path)
+
+
+def _load_eval_progress(
+    path: Path,
+    *,
+    eval_step: int,
+    eval_num_episode: int,
+    chunk_len: int,
+    candidate_tasks: list[str],
+) -> dict | None:
+    if not path.exists():
+        return None
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    expected = {
+        "schema_version": 1,
+        "eval_step": int(eval_step),
+        "eval_num_episode": int(eval_num_episode),
+        "chunk_len": int(chunk_len),
+        "candidate_tasks": candidate_tasks,
+    }
+    mismatches = {
+        key: (payload.get(key), value)
+        for key, value in expected.items()
+        if payload.get(key) != value
+    }
+    if mismatches:
+        raise RuntimeError(
+            f"Evaluation progress at {path} is incompatible with this run: {mismatches}. "
+            "Move or delete that file to start this evaluation from scratch."
+        )
+    return payload
+
+
+def _save_eval_agent_snapshot(
+    path: Path,
+    *,
+    agent: QAgentLang,
+    eval_step: int,
+    chunk_len: int,
+    candidate_tasks: list[str],
+) -> None:
+    payload = {
+        "schema_version": 1,
+        "eval_step": int(eval_step),
+        "chunk_len": int(chunk_len),
+        "candidate_tasks": candidate_tasks,
+        "agent_state": {
+            key: value.detach().cpu()
+            for key, value in agent.state_dict().items()
+        },
+    }
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("wb") as handle:
+        torch.save(payload, handle)
+        handle.flush()
+        os.fsync(handle.fileno())
+    tmp_path.replace(path)
+
+
+def _load_eval_agent_snapshot(
+    path: Path,
+    *,
+    agent: QAgentLang,
+    device: torch.device,
+    eval_step: int,
+    chunk_len: int,
+    candidate_tasks: list[str],
+) -> None:
+    snapshot = torch.load(path, map_location=device, weights_only=True)
+    expected = {
+        "schema_version": 1,
+        "eval_step": int(eval_step),
+        "chunk_len": int(chunk_len),
+        "candidate_tasks": candidate_tasks,
+    }
+    mismatches = {
+        key: (snapshot.get(key), value)
+        for key, value in expected.items()
+        if snapshot.get(key) != value
+    }
+    if mismatches:
+        raise RuntimeError(
+            f"Evaluation agent snapshot at {path} is incompatible: {mismatches}"
+        )
+    agent.load_state_dict(snapshot["agent_state"], strict=True)
+
 # ----------------------------------------------------------------------
 # Main eval loop
 # ----------------------------------------------------------------------
@@ -284,8 +406,9 @@ def run_franka_evaluation(
     output_dir: str | Path | None = "outputs",
     lang_cfg,
     lang_embedder,
-    chunk_len: int = 1,
-) -> tuple[dict[str, float], float]:
+    chunk_len: int = 1,  ##################
+    resume_progress: bool = True,
+) -> dict[str, float]:
     device = torch.device(device)
     agent.eval()
     num_envs: int = env.num_envs if hasattr(env, "num_envs") else 1
@@ -300,43 +423,133 @@ def run_franka_evaluation(
     for index, task in enumerate(candidate_tasks, start=1):
         logger.info(f"task {index}: {task}")
 
+    progress_path = Path(cycle_dir) / "evaluation_progress.json"
+    if not resume_progress:
+        progress_path.unlink(missing_ok=True)
+    saved_progress = (
+        _load_eval_progress(
+            progress_path,
+            eval_step=eval_step,
+            eval_num_episode=eval_num_episode,
+            chunk_len=chunk_len,
+            candidate_tasks=candidate_tasks,
+        )
+        if resume_progress
+        else None
+    )
+    snapshot_path = Path(cycle_dir) / "evaluation_agent.pt"
+    evaluation_incomplete = (
+        saved_progress is None or saved_progress.get("status") != "complete"
+    )
+    if evaluation_incomplete:
+        if resume_progress and snapshot_path.exists():
+            _load_eval_agent_snapshot(
+                snapshot_path,
+                agent=agent,
+                device=device,
+                eval_step=eval_step,
+                chunk_len=chunk_len,
+                candidate_tasks=candidate_tasks,
+            )
+            logger.info(f"Restored evaluation agent snapshot from {snapshot_path}")
+        elif saved_progress is not None:
+            raise RuntimeError(
+                f"Evaluation progress exists at {progress_path}, but its agent "
+                f"snapshot is missing at {snapshot_path}. Refusing to mix policies."
+            )
+        else:
+            _save_eval_agent_snapshot(
+                snapshot_path,
+                agent=agent,
+                eval_step=eval_step,
+                chunk_len=chunk_len,
+                candidate_tasks=candidate_tasks,
+            )
+            logger.info(f"Saved evaluation agent snapshot to {snapshot_path}")
+
     successes_by_task: dict[str, list[bool]] = {
-        task: [] for task in candidate_tasks
+        task: list(saved_progress["successes_by_task"].get(task, []))
+        if saved_progress is not None else []
+        for task in candidate_tasks
     }
-    successes: list[bool] = []
+    successes: list[bool] = [
+        success
+        for task in candidate_tasks
+        for success in successes_by_task[task]
+    ]
     # 每 episode 的缓冲
     ep_combined_buffers: list[list[np.ndarray]] = [[] for _ in range(num_envs)]
     ep_residual_buffers: list[list[np.ndarray]] = [[] for _ in range(num_envs)]
     ep_q_preds: list[list[float]] = [[] for _ in range(num_envs)]
 
     # 已完成 episode 聚合
-    all_combined_trajs: list[np.ndarray] = []
-    all_residual_trajs: list[np.ndarray] = []
+    all_combined_trajs: list[np.ndarray] = (
+        [np.asarray(trajectory, dtype=np.float32) for trajectory in saved_progress["all_combined_trajs"]]
+        if saved_progress is not None else []
+    )
+    all_residual_trajs: list[np.ndarray] = (
+        [np.asarray(trajectory, dtype=np.float32) for trajectory in saved_progress["all_residual_trajs"]]
+        if saved_progress is not None else []
+    )
     all_q_trajectories_by_task: dict[str, list[list[float]]] = {
-        task: [] for task in candidate_tasks
+        task: list(saved_progress["all_q_trajectories_by_task"].get(task, []))
+        if saved_progress is not None else []
+        for task in candidate_tasks
     }
     # all_episode_lengths: list[int] = []
 
     frame_buffer: list[list[np.ndarray]] | None = [[] for _ in range(num_envs)] if save_video else None
 
-    done_episodes = 0
+    done_episodes = len(successes)
     total_episodes = eval_num_episode * len(candidate_tasks)
-    task_index = 0
+    if not (
+        done_episodes == len(all_combined_trajs) == len(all_residual_trajs)
+        and all(len(successes_by_task[task]) <= eval_num_episode for task in candidate_tasks)
+        and all(
+            len(all_q_trajectories_by_task[task]) == len(successes_by_task[task])
+            for task in candidate_tasks
+        )
+    ):
+        raise RuntimeError(f"Inconsistent evaluation progress in {progress_path}")
+    if done_episodes > total_episodes:
+        raise RuntimeError(
+            f"Evaluation progress has {done_episodes} episodes, expected at most {total_episodes}"
+        )
+
+    task_index = min(done_episodes // eval_num_episode, len(candidate_tasks) - 1)
     task_prompt = candidate_tasks[task_index]
     logger.info(f"---------------- task {task_index + 1}: {task_prompt} ----------------")
     env.evaluation = True
-    obs = env.reset(task_prompt, evaluate_previous=False)
-    task_emb = lang_embedder(task_prompt)
-    obs = _attach_task_emb(obs,lang_cfg, task_emb)
 
     progress_by_task = {
-        task: ["."] * eval_num_episode for task in candidate_tasks
+        task: [
+            *("✓" if success else "✗" for success in successes_by_task[task]),
+            *(["."] * (eval_num_episode - len(successes_by_task[task]))),
+        ]
+        for task in candidate_tasks
     }
-    logger.info(
-        f"Evaluating {eval_num_episode} episodes: {''.join(progress_by_task[task_prompt])}",
-        end="",
-        flush=True,
-    )
+    if saved_progress is not None:
+        logger.info(
+            f"Resuming evaluation from {progress_path}: "
+            f"{done_episodes}/{total_episodes} episodes already complete"
+        )
+        # Keep artifact numbering monotonic after a process restart so images
+        # belonging to completed episodes are not overwritten.
+        env.task_reward_generator.round = max(
+            int(env.task_reward_generator.round), done_episodes
+        )
+        if hasattr(env, "round"):
+            env.round = max(int(env.round), done_episodes)
+
+    if done_episodes < total_episodes:
+        obs = env.reset(task_prompt, evaluate_previous=False)
+        task_emb = lang_embedder(task_prompt) if lang_embedder is not None else None
+        obs = _attach_task_emb(obs,lang_cfg, task_emb)
+        logger.info(
+            f"Evaluating {eval_num_episode} episodes: {''.join(progress_by_task[task_prompt])}",
+            end="",
+            flush=True,
+        )
     image_keys = [
         # "observation.images.head_view",
         # "observation.images.wrist_right_view",
@@ -440,6 +653,22 @@ def run_franka_evaluation(
             ep_q_preds[0] = []
 
             done_episodes += 1
+            _save_eval_progress(
+                progress_path,
+                eval_step=eval_step,
+                eval_num_episode=eval_num_episode,
+                chunk_len=chunk_len,
+                candidate_tasks=candidate_tasks,
+                successes_by_task=successes_by_task,
+                all_combined_trajs=all_combined_trajs,
+                all_residual_trajs=all_residual_trajs,
+                all_q_trajectories_by_task=all_q_trajectories_by_task,
+                status="in_progress",
+            )
+            logger.info(
+                f"Saved evaluation progress: {done_episodes}/{total_episodes}"
+            )
+            logger.info("-------------------------------------------------------------------")
 
             next_task_index = min(done_episodes // eval_num_episode, len(candidate_tasks) - 1)
             if done_episodes < total_episodes and next_task_index != task_index:
@@ -454,7 +683,7 @@ def run_franka_evaluation(
                     flush=True,
                 )
     
-            task_emb = lang_embedder(task_prompt)
+            task_emb = lang_embedder(task_prompt) if lang_embedder is not None else None
         next_obs = _attach_task_emb(next_obs,lang_cfg, task_emb)
         obs = next_obs
 
@@ -517,6 +746,20 @@ def run_franka_evaluation(
     plt.close(fig_residual)
     for figure in q_figures.values():
         plt.close(figure)
+
+    _save_eval_progress(
+        progress_path,
+        eval_step=eval_step,
+        eval_num_episode=eval_num_episode,
+        chunk_len=chunk_len,
+        candidate_tasks=candidate_tasks,
+        successes_by_task=successes_by_task,
+        all_combined_trajs=all_combined_trajs,
+        all_residual_trajs=all_residual_trajs,
+        all_q_trajectories_by_task=all_q_trajectories_by_task,
+        status="complete",
+    )
+    snapshot_path.unlink(missing_ok=True)
 
     logger.info("--------------------------------------------------------------------------------------")
 

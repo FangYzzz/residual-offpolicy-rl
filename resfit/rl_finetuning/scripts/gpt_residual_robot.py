@@ -46,7 +46,21 @@ def prevent_keyboard_interrupt():
             raise KeyboardInterrupt
 
 class Args:
-    max_timesteps: int = 200 # 150 # 200 # 180   
+    # Fallback for prompts that are not listed in ``task_max_timesteps``.
+    max_timesteps: int = 200
+
+    # Maximum episode length for each task. Keep the keys identical to the
+    # prompts produced by TaskRewardGenerator (or passed in during evaluation).
+    task_max_timesteps: dict[str, int] = {
+        "Put a cube into the bowl": 160,  # 140
+        "Take the cube out of the bowl": 140,  # 130
+        "Stack one cube on the other cube": 200,
+        "Take the top cube off the other cube": 130,
+        "Open the drawer": 140,
+        "Close the drawer": 100,
+        "Hang the mug on the mug tree": 210,
+        "Take the mug off the mug tree": 340,
+    }
 
     # GPT server(task_reward_generation_zedx.py)
     gpt_host: str = "127.0.0.1"  # 机器 IP
@@ -56,19 +70,38 @@ class Args:
     pi05_host: str = "127.0.0.1"  # 机器 IP
     pi05_port: int = 8008  # 端口
 
+    # DROID uses 0=open and 1=closed. Require consecutive predictions before
+    # accepting a binary gripper state change.
+    gripper_close_threshold: float = 0.9 # 0.994-1.004
+    gripper_open_threshold: float = 0.1 # -0.004-0.003
+    gripper_confirm_steps: int = 2
+
 
 
 class BasePolicy:
-    def __init__(self, main_host, main_port, action_scaler, state_standardizer, args=Args):
+    def __init__(
+        self,
+        main_host,
+        main_port,
+        action_scaler,
+        state_standardizer,
+        args=Args,
+        connect_robot=True,
+        save_images=True,
+    ):
         self.device = torch.device("cuda") # cpu
         self.training = False
         self.server = f"http://{main_host}:{main_port}"
         self.action_scaler = action_scaler
         self._last_base_action = None
         self.state_standardizer = state_standardizer
+        self.save_images = bool(save_images)
         self.base_action_buffer =[]
+        self.rl_token_encoder = None
+        self.rl_token_obs_key = "observation.rl_token"
+        self._last_rl_token = None
 
-        self.env = RobotEnv(action_space="cartesian_position", gripper_action_space="position")
+        self.env = None
         self.args = args
         self.pi05_client = websocket_client_policy.WebsocketClientPolicy(args.pi05_host, args.pi05_port)
         # self.text = "pick up the tomato and place it into the bowl"
@@ -82,8 +115,124 @@ class BasePolicy:
         self.last_excution_time  = time.time()
         self.eefpose = None
         self.gripper_position = None
-        self.task_reward_generator = TaskRewardGenerator()
+        self.task_reward_generator = None
         self.evaluation = False
+        if connect_robot:
+            self.connect_online_resources(required=True)
+        else:
+            print(
+                "[BasePolicy] WARNING: robot connection skipped during offline "
+                "embedding/VAE processing; dataset observations will be used."
+            )
+
+    def connect_robot(self, required=False):
+        """Lazily connect hardware; offline VLA processing does not need it."""
+        if self.env is not None:
+            return True
+        try:
+            self.env = RobotEnv(action_space="cartesian_position", gripper_action_space="position")
+            print("[BasePolicy] robot connected")
+            return True
+        except Exception as exc:  # noqa: BLE001
+            print(
+                "[BasePolicy] WARNING: robot is not connected. Offline embedding/VAE "
+                f"processing can continue without it. Details: {exc}"
+            )
+            if required:
+                raise RuntimeError("Robot connection is required for online rollout") from exc
+            return False
+
+    def _stabilize_gripper_chunk(
+        self, raw_gripper: np.ndarray, current_position
+    ) -> np.ndarray:
+        """Debounce binary gripper commands while preserving intentional changes."""
+        close_threshold = float(self.args.gripper_close_threshold)
+        open_threshold = float(self.args.gripper_open_threshold)
+        confirm_steps = int(self.args.gripper_confirm_steps)
+        if not (0.0 <= open_threshold < close_threshold <= 1.0):
+            raise ValueError(
+                "Expected 0 <= gripper_open_threshold < "
+                "gripper_close_threshold <= 1"
+            )
+        if confirm_steps < 1:
+            raise ValueError("gripper_confirm_steps must be >= 1")
+        if current_position is None:
+            raise ValueError("current gripper position is required for stabilization")
+
+        raw = np.asarray(raw_gripper, dtype=np.float32).reshape(-1)
+        current = float(np.asarray(current_position).reshape(-1)[0])
+        state = int(current >= 0.5)
+        stable = np.empty_like(raw)
+        close_count = 0
+        open_count = 0
+
+        for index, value in enumerate(raw):
+            if np.isfinite(value) and value >= close_threshold:
+                close_count += 1
+                open_count = 0
+            elif np.isfinite(value) and value <= open_threshold:
+                open_count += 1
+                close_count = 0
+            else:
+                close_count = 0
+                open_count = 0
+
+            if state == 0 and close_count >= confirm_steps:
+                state = 1
+                close_count = 0
+            elif state == 1 and open_count >= confirm_steps:
+                state = 0
+                open_count = 0
+            stable[index] = state
+
+        suppressed_close_spikes = int(
+            np.count_nonzero((raw >= close_threshold) & (stable == 0))
+        )
+        if suppressed_close_spikes:
+            print(
+                f"[gripper-filter] suppressed {suppressed_close_spikes} "
+                f"unconfirmed close prediction(s); raw range="
+                f"[{raw.min():.3f}, {raw.max():.3f}]"
+            )
+        return stable
+
+    def connect_online_resources(self, required=False):
+        """Connect resources needed only by real-robot rollout/evaluation."""
+        try:
+            if self.task_reward_generator is None:
+                self.task_reward_generator = TaskRewardGenerator(
+                    save_images=self.save_images
+                )
+                print("[BasePolicy] reward camera/task generator connected")
+            robot_connected = self.connect_robot(required=required)
+            return self.task_reward_generator is not None and robot_connected
+        except Exception as exc:  # noqa: BLE001
+            print(
+                "[BasePolicy] WARNING: online robot resources are unavailable. "
+                f"Offline processing is unaffected. Details: {exc}"
+            )
+            if required:
+                raise RuntimeError(
+                    "Franka and the ZED reward camera are required for online rollout"
+                ) from exc
+            return False
+
+    def _require_robot(self):
+        if self.env is None or self.task_reward_generator is None:
+            self.connect_online_resources(required=True)
+
+    def get_task_max_timesteps(self, task_prompt: Optional[str] = None) -> int:
+        """Return the configured episode length for the active task."""
+        task = task_prompt if task_prompt is not None else self.text
+        max_timesteps = self.args.task_max_timesteps.get(
+            task, self.args.max_timesteps
+        )
+        if not isinstance(max_timesteps, int) or max_timesteps <= 0:
+            raise ValueError(
+                f"max_timesteps for task {task!r} must be a positive integer, "
+                f"got {max_timesteps!r}"
+            )
+        return max_timesteps
 
     def to(self, device: str | torch.device):
         self.device = torch.device(device)
@@ -104,10 +253,54 @@ class BasePolicy:
         augmented_obs = raw_obs.copy()
         augmented_obs["observation.base_action"] = base_naction
         augmented_obs["observation.state"] = self.state_standardizer.standardize(augmented_obs["observation.state"])
+        if self._last_rl_token is not None:
+            token = self._last_rl_token.to(base_naction.device)
+            # Observations use a leading environment/batch dimension.  Keeping
+            # the token consistent with state/base_action prevents replay
+            # insertion from mistaking token_dim for num_envs and selecting a
+            # single scalar with ``token[i]``.
+            if token.ndim == 1:
+                token = token.unsqueeze(0)
+            augmented_obs[self.rl_token_obs_key] = token
 
         return augmented_obs
+
+    def set_rl_token_encoder(self, encoder, obs_key="observation.rl_token"):
+        self.rl_token_encoder = encoder
+        self.rl_token_obs_key = obs_key
+
+    @torch.no_grad()
+    def get_offline_vla_embedding(self, raw_obs, task_prompt):
+        """Request final pi0 camera+language features without using a text side encoder."""
+        obs_right = raw_obs["wrist_image_left"].detach().cpu().numpy()
+        obs_wrist = raw_obs["exterior_image_2_left"].detach().cpu().numpy()
+        eef_pose = raw_obs["eef_position"].detach().cpu().numpy()
+        gripper = raw_obs["gripper_position"].detach().cpu().numpy()
+        _, right, wrist = process_policy_images(obs_left=None, obs_right=obs_right, obs_wrist=obs_wrist)
+        if eef_pose.ndim == 2:
+            eef_pose = eef_pose.squeeze(0)
+        result = self.pi05_client.infer({
+            "observation/wrist_image_left": image_tools.resize_with_pad(right, 224, 224),
+            "observation/exterior_image_2_left": image_tools.resize_with_pad(wrist, 224, 224),
+            "observation/eef_position": eef_pose,
+            "observation/gripper_position": gripper,
+            "prompt": task_prompt,
+            "return_vla_embedding": True,
+            "embedding_only": True,
+        })
+        if "vla_embedding" not in result or "vla_embedding_mask" not in result:
+            raise RuntimeError(
+                "The pi0 server did not return RL-token features. "
+                f"Response keys were {sorted(result.keys())}. Restart the server from "
+                "/home/yuan/self_vla/openpi after applying the RL-token policy changes."
+            )
+        # The msgpack decoder may expose read-only NumPy views. Copy before
+        # converting so PyTorch never receives non-writable storage.
+        return (torch.from_numpy(np.array(result["vla_embedding"], dtype=np.float32, copy=True)),
+                torch.from_numpy(np.array(result["vla_embedding_mask"], dtype=np.bool_, copy=True)))
     
     def update_obs(self):
+        self._require_robot()
         self.obs = _extract_observation(
             self.env.get_observation(),
             save_to_disk=False,
@@ -115,6 +308,8 @@ class BasePolicy:
         self.gripper_position = self.obs["gripper_position"]
     
     def save_debug_images(self, obs_left=None, obs_right=None, obs_wrist=None, save_dir="debug_images"):
+        if not self.save_images:
+            return
         os.makedirs(save_dir, exist_ok=True)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -213,6 +408,15 @@ class BasePolicy:
         return augemnted_obs
 
     def reset(self, task_prompt=None, evaluate_previous=True):
+        self._require_robot()
+        # A base-action plan must never cross a task/episode boundary. Clear it
+        # before any environment or VLA operation so an exception during reset
+        # cannot leave stale actions available to the next task.
+        stale_actions = len(self.base_action_buffer)
+        self.base_action_buffer.clear()
+        self._last_base_action = None
+        self._last_rl_token = None
+        print(f"[BasePolicy.reset] cleared {stale_actions} buffered base action(s)")
         self.t_step = 0
         self.env.reset()  # 1.593s
 
@@ -221,7 +425,16 @@ class BasePolicy:
         
         if self.round != 0 and evaluate_previous:
             self.update_obs()
-            self.reward =  float(self.task_reward_generator.reward_generation(self.obs["right_image"], task_prompt))  # 0 or 1
+            self.reward = float(
+                self.task_reward_generator.reward_generation(
+                    self.obs["right_image"],
+                    task_prompt,
+                    # Training keeps the separator immediately after its
+                    # reward block. Evaluation prints it after the per-episode
+                    # result and accumulated progress instead.
+                    log_separator=not self.evaluation,
+                )
+            )  # 0 or 1
             # print("reward:", self.reward)
             # logger.info(f"Reward: {reward}")
             time.sleep(7)
@@ -233,7 +446,10 @@ class BasePolicy:
         elif task_prompt is not None:
             self.task_reward_generator.start_task(self.obs["right_image"])
             self.round = self.task_reward_generator.round
+            self.text = task_prompt
+        self.max_timesteps = self.get_task_max_timesteps(task_prompt)
         print("current task:", self.text)
+        print("max timesteps:", self.max_timesteps)
         if task_prompt==None:
             obs_for_pi0 = self.get_obs_for_base(self.text)
         else:
@@ -285,14 +501,25 @@ class BasePolicy:
                 "prompt": task_prompt,  # instruction
             }
 
-            pred_action_chunk = self.pi05_client.infer(request_data)["actions"]
+            if self.rl_token_encoder is not None:
+                request_data["return_vla_embedding"] = True
+            result = self.pi05_client.infer(request_data)
+            pred_action_chunk = result["actions"]
+            if self.rl_token_encoder is not None:
+                if "vla_embedding" not in result or "vla_embedding_mask" not in result:
+                    raise RuntimeError(f"pi0 response is missing RL-token features: {sorted(result.keys())}")
+                emb = torch.from_numpy(np.array(result["vla_embedding"], dtype=np.float32, copy=True)).to(self.device).unsqueeze(0)
+                valid = torch.from_numpy(np.array(result["vla_embedding_mask"], dtype=np.bool_, copy=True)).to(self.device).unsqueeze(0)
+                self._last_rl_token = self.rl_token_encoder.encode(emb, ~valid).squeeze(0)
             assert pred_action_chunk.shape == (50, 8) # 10,8
             # action = pred_action_chunk[0]
             action = pred_action_chunk[:35] # 35 # 30 # 20
             # action = action[::2]
 
             action = np.asarray(action).copy()
-            action[:, -1] = (action[:, -1] > 0.9).astype(action.dtype) # 0.6 0.5
+            action[:, -1] = self._stabilize_gripper_chunk(
+                action[:, -1], gripper_position
+            )
 
             # 如果前3维是 delta position，就转成 absolute position
             action[:,:3] = action[:,:3] + eef_pose[:3]  # [20,8] todo!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
@@ -309,14 +536,25 @@ class BasePolicy:
         return action_base
     
     def get_online_action_base(self, obs_for_pi0):
-        pred_action_chunk = self.pi05_client.infer(obs_for_pi0)["actions"]
+        if self.rl_token_encoder is not None:
+            obs_for_pi0["return_vla_embedding"] = True
+        result = self.pi05_client.infer(obs_for_pi0)
+        pred_action_chunk = result["actions"]
+        if self.rl_token_encoder is not None:
+            if "vla_embedding" not in result or "vla_embedding_mask" not in result:
+                raise RuntimeError(f"pi0 response is missing RL-token features: {sorted(result.keys())}")
+            emb = torch.from_numpy(np.array(result["vla_embedding"], dtype=np.float32, copy=True)).to(self.device).unsqueeze(0)
+            valid = torch.from_numpy(np.array(result["vla_embedding_mask"], dtype=np.bool_, copy=True)).to(self.device).unsqueeze(0)
+            self._last_rl_token = self.rl_token_encoder.encode(emb, ~valid).squeeze(0)
         assert pred_action_chunk.shape == (50, 8) # 10,8
         # action = pred_action_chunk[0]
         action = pred_action_chunk[:35]  # 35
         # action = action[::2]   # down sampling frequency
 
         action = np.asarray(action).copy()
-        action[:, -1] = (action[:, -1] > 0.9).astype(action.dtype) # 0.6 0.5
+        action[:, -1] = self._stabilize_gripper_chunk(
+            action[:, -1], self.gripper_position
+        )
         # 如果前3维是 delta position，就转成 absolute position
         print(f"self.eefpose[:3] {self.eefpose[:3]}")
         action[:,:3] = action[:,:3] + self.eefpose[:3]  # [20,8] todo!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
@@ -326,8 +564,12 @@ class BasePolicy:
         return action
 
     def step(self, residual_action, task_prompt = None, evaluation=False):
-        # residual_action = torch.zeros_like(residual_action) ##
-        residual_action[:, -1] = 0
+        # For safe position-only residual learning, leave orientation and
+        # gripper entirely under the base policy's control. Clone first so
+        # logging/training callers do not observe an unexpected in-place edit.
+        residual_action = residual_action.clone()
+        residual_action[..., 3:7] = 0.0
+        residual_action[..., 7] = 0.0
         combined_action = self._last_base_action + residual_action
         unscaled_combined_action = self.action_scaler.unscale(combined_action)
         self.evaluation = evaluation
@@ -462,7 +704,7 @@ class BasePolicy:
         gripper = combined_action[7:]
 
         # 触地保护
-        z_min = 0.22  # 0.225
+        z_min = 0.20  # 0.225
         pos[2] = max(pos[2], z_min)
         
         norm = np.linalg.norm(q_action, keepdims=True)
@@ -488,7 +730,10 @@ class BasePolicy:
         print("trajectory steps:::::::::::::::::::::::", self.t_step)
         
         terminated = False  # terminated：任务本身的终止条件满足 TODO: 每隔一段时间请求一次 gpt 生成 reward
-        truncated = (self.t_step >= self.args.max_timesteps - 1)  # truncated：被外部强制截断（时间上限等）
+        # Each task can have its own time limit. Since t_step is incremented
+        # after executing the action, >= max_timesteps permits exactly that
+        # many environment steps.
+        truncated = self.t_step >= self.max_timesteps
         done = terminated | truncated
         
         if done:
