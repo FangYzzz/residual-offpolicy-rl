@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 import imageio
 import matplotlib
@@ -265,10 +266,24 @@ def _inject_task_emb(
     obs[key] = emb.to(state.device if state is not None else task_emb.device)
     return obs
 
-def _attach_task_emb(obs, lang_cfg, task_emb):
-            if not lang_cfg.enabled or task_emb is None or obs is None:
-                return obs
-            return _inject_task_emb(obs, task_emb, key=lang_cfg.lang_emb_obs_key)
+def _attach_task_context(obs, agent, lang_cfg, task_emb, task_id: int):
+    if obs is None:
+        return obs
+    if lang_cfg.enabled:
+        if task_emb is None:
+            raise RuntimeError("task_emb is required when language conditioning is enabled")
+        _inject_task_emb(obs, task_emb, key=lang_cfg.lang_emb_obs_key)
+    if getattr(agent, "task_specific_actor", False):
+        state = obs.get("observation.state")
+        device = state.device if isinstance(state, torch.Tensor) else None
+        if isinstance(state, torch.Tensor) and state.ndim == 2:
+            value = torch.full(
+                (state.shape[0],), int(task_id), dtype=torch.long, device=device
+            )
+        else:
+            value = torch.tensor(int(task_id), dtype=torch.long, device=device)
+        obs[agent.task_id_obs_key] = value
+    return obs
 
 
 def _save_eval_progress(
@@ -408,7 +423,8 @@ def run_franka_evaluation(
     lang_embedder,
     chunk_len: int = 1,  ##################
     resume_progress: bool = True,
-) -> dict[str, float]:
+    initialize_task_success_metrics: bool = False,
+) -> dict[str, Any]:
     device = torch.device(device)
     agent.eval()
     num_envs: int = env.num_envs if hasattr(env, "num_envs") else 1
@@ -544,7 +560,7 @@ def run_franka_evaluation(
     if done_episodes < total_episodes:
         obs = env.reset(task_prompt, evaluate_previous=False)
         task_emb = lang_embedder(task_prompt) if lang_embedder is not None else None
-        obs = _attach_task_emb(obs,lang_cfg, task_emb)
+        obs = _attach_task_context(obs, agent, lang_cfg, task_emb, task_index)
         logger.info(
             f"Evaluating {eval_num_episode} episodes: {''.join(progress_by_task[task_prompt])}",
             end="",
@@ -578,10 +594,7 @@ def run_franka_evaluation(
             if getattr(agent, "residual_actor", False) and "observation.base_action" in obs:
                 q_actions = torch.clamp(obs["observation.base_action"] + actions, -1.0, 1.0)
 
-            q_pred = (
-                agent.critic.q_value(obs_q["feat"], obs_q["observation.state"], q_actions)
-                .detach().cpu().squeeze(-1)
-            )
+            q_pred = agent.predict_q(obs_q, q_actions).detach().cpu().squeeze(-1)
             q_pred = q_pred.reshape(-1)
 
         # -----------------------------------------------------------
@@ -684,7 +697,9 @@ def run_franka_evaluation(
                 )
     
             task_emb = lang_embedder(task_prompt) if lang_embedder is not None else None
-        next_obs = _attach_task_emb(next_obs,lang_cfg, task_emb)
+        next_obs = _attach_task_context(
+            next_obs, agent, lang_cfg, task_emb, task_index
+        )
         obs = next_obs
 
     logger.info("Done")
@@ -737,6 +752,23 @@ def run_franka_evaluation(
             "eval/xyz_trajectories_combined": wandb.Image(fig_combined),
             "eval/xyz_trajectories_residual": wandb.Image(fig_residual),
         }
+        if initialize_task_success_metrics:
+            initial_rates = {
+                task: metrics[f"eval/task_{index + 1}/success_rate"]
+                for index, task in enumerate(candidate_tasks)
+            }
+            sampling_weights = {
+                task: max(1e-6, 1.0 - initial_rates[task])
+                for task in candidate_tasks
+            }
+            weight_total = sum(sampling_weights.values())
+            for index, task in enumerate(candidate_tasks):
+                log_dict[f"tasks/task_{index}_success_rate"] = initial_rates[task]
+                log_dict[f"tasks/task_{index}_episode_count"] = 0
+                log_dict[f"tasks/task_{index}_probability"] = (
+                    sampling_weights[task] / weight_total
+                )
+                log_dict[f"tasks/task_{index}_attempts"] = 0
         for index, task in enumerate(candidate_tasks):
             if task in q_figures:
                 log_dict[f"eval/task_{index + 1}/q_trajectories"] = wandb.Image(q_figures[task])
@@ -760,6 +792,14 @@ def run_franka_evaluation(
         status="complete",
     )
     snapshot_path.unlink(missing_ok=True)
+
+    # Keep ordered per-episode outcomes out of the W&B metric payload, but
+    # return them to the trainer so the initial evaluation itself becomes the
+    # first full success-rate rolling window.
+    metrics["_eval_outcomes_by_task"] = {
+        task: [int(success) for success in successes_by_task[task]]
+        for task in candidate_tasks
+    }
 
     logger.info("--------------------------------------------------------------------------------------")
 

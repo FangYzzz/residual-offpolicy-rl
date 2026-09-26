@@ -146,6 +146,12 @@ class QAgentConfig:
     critic: CriticConfig = field(default_factory=lambda: CriticConfig())
     actor: ActorConfig = field(default_factory=lambda: ActorConfig())
     language: LanguageConfig | None = field(default_factory=LanguageConfig)
+    # Optional hard actor routing. The image/RL-token encoder and critic stay
+    # shared, while every discrete task owns an independent residual actor and
+    # actor target.
+    task_specific_actor: bool = False
+    num_tasks: int = 1
+    task_id_obs_key: str = "observation.task_id"
     # gradient clipping
     critic_grad_clip_norm: float = 1.0
     actor_grad_clip_norm: float = 0.1 # 1.0
@@ -166,7 +172,7 @@ class QAgentConfig:
     # encoder freezing
     freeze_encoder: bool = False  # Whether to freeze encoder parameters (no gradient updates)
 
-    clip_q_target_to_reward_range: bool = False
+    clip_q_target_to_reward_range: bool = True
 
     # TD3 target action noise configuration
     target_action_noise: bool = True  # Whether to add noise to target actions in TD3
@@ -177,12 +183,13 @@ class QAgentConfig:
     # Q(s, a_base + residual) - Q(s, a_base) > gate_threshold; otherwise the base
     # action is executed (residual -> 0). Applied both when acting and in the critic
     # target's next-action selection. Default off (existing behavior).
-    gate_mode: str = "off"  # "off" or "hard"
+    gate_mode: str = "hard"  # "off" or "hard"
     use_residual_gate: bool = False  # alternative switch; "hard" gate_mode also enables it
-    gate_threshold: float = 0.0  # Q-advantage threshold for adopting the residual
+    gate_threshold: float = 0.0  # 0.001  # Q-advantage threshold for adopting the residual
 
     def __post_init__(self):
-        pass
+        if self.num_tasks < 1:
+            raise ValueError(f"num_tasks must be >= 1, got {self.num_tasks}")
 
 
 # -----------------------------------------------------------------------------

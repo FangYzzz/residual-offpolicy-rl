@@ -13,4 +13,5 @@ deps/
 *.png
 debug_images/
 rl_token_checkpoints/
+rl_token_checkpoints_*/
 vla_embedding_cache/

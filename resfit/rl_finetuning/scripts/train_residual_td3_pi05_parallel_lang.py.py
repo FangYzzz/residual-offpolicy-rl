@@ -182,7 +182,14 @@ class LanguageEmbedder:
                     normalize_embeddings=True,
                 ).to(self.device).float()
         else:
-            seed = abs(hash(text)) % (2**31 - 1)
+            # Python's built-in hash() is salted independently for every
+            # process, so it cannot be used for an embedding that must remain
+            # compatible with replay caches and resumed checkpoints. Derive a
+            # stable seed from the UTF-8 task text instead.
+            digest = hashlib.sha256(text.encode("utf-8")).digest()
+            seed = int.from_bytes(digest[:8], byteorder="big", signed=False) % (
+                2**31 - 1
+            )
             g = torch.Generator(device="cpu").manual_seed(seed)
             vec = torch.randn(self.emb_dim, generator=g)
             vec = (vec / vec.norm()).to(self.device).float()

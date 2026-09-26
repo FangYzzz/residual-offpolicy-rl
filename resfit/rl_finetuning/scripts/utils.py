@@ -106,15 +106,12 @@ def _extract_observation(obs_dict, *, save_to_disk=False):
         elif "wrist_cam" in key:
             wrist_image = image_observations[key]
 
-    # Drop the alpha dimension
-    left_image = left_image[..., :3]
-    right_image = right_image[..., :3]
-    wrist_image = wrist_image[..., :3]
-
-    # Convert to RGB
-    left_image = left_image[..., ::-1]
-    right_image = right_image[..., ::-1]
-    wrist_image = wrist_image[..., ::-1]
+    # ZEDXCamera.read_camera() already converts the camera's BGRA frames to RGB.
+    # Only drop the alpha channel here. Reversing the channels a second time
+    # would turn red objects blue in both the saved artifacts and GPT input.
+    left_image = np.ascontiguousarray(left_image[..., :3])
+    right_image = np.ascontiguousarray(right_image[..., :3])
+    wrist_image = np.ascontiguousarray(wrist_image[..., :3])
 
     robot_state = obs_dict["robot_state"]
     cartesian_position = np.array(robot_state["cartesian_position"])
@@ -176,7 +173,6 @@ def _extract_observation(obs_dict, *, save_to_disk=False):
 #         wrist_resized = resize_hwc(wrist, residual_size)
 
 #     return left_resized, right_resized, wrist_resized
-
 
 
 

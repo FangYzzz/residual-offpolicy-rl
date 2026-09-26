@@ -88,6 +88,10 @@ class BasePolicy:
         args=Args,
         connect_robot=True,
         save_images=True,
+        candidate_tasks: Optional[list[str]] = None,
+        success_rate_window_size: int = 20,
+        min_task_sample_probability: float = 0.05,
+        prioritize_low_success_tasks: bool = True,
     ):
         self.device = torch.device("cuda") # cpu
         self.training = False
@@ -96,10 +100,26 @@ class BasePolicy:
         self._last_base_action = None
         self.state_standardizer = state_standardizer
         self.save_images = bool(save_images)
+        self.candidate_tasks = candidate_tasks
+        self.success_rate_window_size = int(success_rate_window_size)
+        self.min_task_sample_probability = float(min_task_sample_probability)
+        self.prioritize_low_success_tasks = bool(prioritize_low_success_tasks)
         self.base_action_buffer =[]
         self.rl_token_encoder = None
         self.rl_token_obs_key = "observation.rl_token"
         self._last_rl_token = None
+        # Keep the commanded gripper state across independently planned pi0
+        # chunks.  The measured gripper position can sit near the middle of
+        # its range while holding an object, so re-inferring open/closed from
+        # that measurement at every 35-step boundary can cause a false open.
+        self._gripper_command_state: Optional[int] = None
+        self._gripper_close_count = 0
+        self._gripper_open_count = 0
+        # Environment step at which the online token was computed. This lets
+        # ``step_chunk`` refresh the token exactly at residual decision
+        # boundaries without duplicating a query when pi0 has just replanned
+        # the base-action chunk at the same observation.
+        self._last_rl_token_step = None
 
         self.env = None
         self.args = args
@@ -145,7 +165,7 @@ class BasePolicy:
     def _stabilize_gripper_chunk(
         self, raw_gripper: np.ndarray, current_position
     ) -> np.ndarray:
-        """Debounce binary gripper commands while preserving intentional changes."""
+        """Debounce commands while latching state across action chunks."""
         close_threshold = float(self.args.gripper_close_threshold)
         open_threshold = float(self.args.gripper_open_threshold)
         confirm_steps = int(self.args.gripper_confirm_steps)
@@ -156,15 +176,21 @@ class BasePolicy:
             )
         if confirm_steps < 1:
             raise ValueError("gripper_confirm_steps must be >= 1")
-        if current_position is None:
-            raise ValueError("current gripper position is required for stabilization")
-
         raw = np.asarray(raw_gripper, dtype=np.float32).reshape(-1)
-        current = float(np.asarray(current_position).reshape(-1)[0])
-        state = int(current >= 0.5)
+        if self._gripper_command_state is None:
+            if current_position is None:
+                raise ValueError(
+                    "current gripper position is required to initialize stabilization"
+                )
+            current = float(np.asarray(current_position).reshape(-1)[0])
+            state = int(current >= 0.5)
+        else:
+            state = self._gripper_command_state
+
+        start_state = state
         stable = np.empty_like(raw)
-        close_count = 0
-        open_count = 0
+        close_count = self._gripper_close_count
+        open_count = self._gripper_open_count
 
         for index, value in enumerate(raw):
             if np.isfinite(value) and value >= close_threshold:
@@ -185,6 +211,13 @@ class BasePolicy:
                 open_count = 0
             stable[index] = state
 
+        # A new pi0 plan is requested only after the previous plan is consumed.
+        # Preserve the final planned command and any partial debounce sequence
+        # so the next chunk begins from the same logical gripper state.
+        self._gripper_command_state = state
+        self._gripper_close_count = close_count
+        self._gripper_open_count = open_count
+
         suppressed_close_spikes = int(
             np.count_nonzero((raw >= close_threshold) & (stable == 0))
         )
@@ -192,16 +225,31 @@ class BasePolicy:
             print(
                 f"[gripper-filter] suppressed {suppressed_close_spikes} "
                 f"unconfirmed close prediction(s); raw range="
-                f"[{raw.min():.3f}, {raw.max():.3f}]"
+                f"[{raw.min():.3f}, {raw.max():.3f}]; "
+                f"latched state {start_state}->{state}"
             )
         return stable
+
+    def reset_gripper_filter_state(self, state: Optional[int] = None) -> None:
+        """Reset the latch at a real or dataset episode boundary."""
+        if state not in (None, 0, 1):
+            raise ValueError(
+                "gripper filter state must be None, 0 (open), or 1 (closed)"
+            )
+        self._gripper_command_state = state
+        self._gripper_close_count = 0
+        self._gripper_open_count = 0
 
     def connect_online_resources(self, required=False):
         """Connect resources needed only by real-robot rollout/evaluation."""
         try:
             if self.task_reward_generator is None:
                 self.task_reward_generator = TaskRewardGenerator(
-                    save_images=self.save_images
+                    save_images=self.save_images,
+                    candidate_tasks=self.candidate_tasks,
+                    success_rate_window_size=self.success_rate_window_size,
+                    min_task_sample_probability=self.min_task_sample_probability,
+                    prioritize_low_success_tasks=self.prioritize_low_success_tasks,
                 )
                 print("[BasePolicy] reward camera/task generator connected")
             robot_connected = self.connect_robot(required=required)
@@ -268,6 +316,36 @@ class BasePolicy:
     def set_rl_token_encoder(self, encoder, obs_key="observation.rl_token"):
         self.rl_token_encoder = encoder
         self.rl_token_obs_key = obs_key
+
+    def _set_rl_token_from_result(self, result):
+        if "vla_embedding" not in result or "vla_embedding_mask" not in result:
+            raise RuntimeError(
+                f"pi0 response is missing RL-token features: {sorted(result.keys())}"
+            )
+        emb = torch.from_numpy(
+            np.array(result["vla_embedding"], dtype=np.float32, copy=True)
+        ).to(self.device).unsqueeze(0)
+        valid = torch.from_numpy(
+            np.array(result["vla_embedding_mask"], dtype=np.bool_, copy=True)
+        ).to(self.device).unsqueeze(0)
+        self._last_rl_token = self.rl_token_encoder.encode(emb, ~valid).squeeze(0)
+        self._last_rl_token_step = self.t_step
+
+    @torch.no_grad()
+    def refresh_online_rl_token(self, task_prompt=None):
+        """Refresh the current-state token without replanning base actions."""
+        if self.rl_token_encoder is None:
+            return False
+        if self._last_rl_token_step == self.t_step:
+            return False
+
+        prompt = self.text if task_prompt is None else task_prompt
+        request_data = self.get_obs_for_base(prompt)
+        request_data["return_vla_embedding"] = True
+        request_data["embedding_only"] = True
+        result = self.pi05_client.infer(request_data)
+        self._set_rl_token_from_result(result)
+        return True
 
     @torch.no_grad()
     def get_offline_vla_embedding(self, raw_obs, task_prompt):
@@ -416,9 +494,13 @@ class BasePolicy:
         self.base_action_buffer.clear()
         self._last_base_action = None
         self._last_rl_token = None
+        self._last_rl_token_step = None
         print(f"[BasePolicy.reset] cleared {stale_actions} buffered base action(s)")
         self.t_step = 0
         self.env.reset()  # 1.593s
+        # RobotEnv.reset() opens the gripper.  Seed the command latch from that
+        # known reset state instead of reclassifying a later grasp aperture.
+        self.reset_gripper_filter_state(state=0)
 
         self.pi05_client.reset()
         print("robot reset successfully")
@@ -442,7 +524,9 @@ class BasePolicy:
         print(f"---------------------------- trajectory {self.round} ----------------------------")
         self.update_obs()
         if self.evaluation ==False:
-            self.text, self.round = self.task_reward_generator.task_generation(self.obs["right_image"])
+            self.text, self.round = self.task_reward_generator.task_generation(
+                self.obs["right_image"]
+            )
         elif task_prompt is not None:
             self.task_reward_generator.start_task(self.obs["right_image"])
             self.round = self.task_reward_generator.round
@@ -506,11 +590,7 @@ class BasePolicy:
             result = self.pi05_client.infer(request_data)
             pred_action_chunk = result["actions"]
             if self.rl_token_encoder is not None:
-                if "vla_embedding" not in result or "vla_embedding_mask" not in result:
-                    raise RuntimeError(f"pi0 response is missing RL-token features: {sorted(result.keys())}")
-                emb = torch.from_numpy(np.array(result["vla_embedding"], dtype=np.float32, copy=True)).to(self.device).unsqueeze(0)
-                valid = torch.from_numpy(np.array(result["vla_embedding_mask"], dtype=np.bool_, copy=True)).to(self.device).unsqueeze(0)
-                self._last_rl_token = self.rl_token_encoder.encode(emb, ~valid).squeeze(0)
+                self._set_rl_token_from_result(result)
             assert pred_action_chunk.shape == (50, 8) # 10,8
             # action = pred_action_chunk[0]
             action = pred_action_chunk[:35] # 35 # 30 # 20
@@ -541,11 +621,7 @@ class BasePolicy:
         result = self.pi05_client.infer(obs_for_pi0)
         pred_action_chunk = result["actions"]
         if self.rl_token_encoder is not None:
-            if "vla_embedding" not in result or "vla_embedding_mask" not in result:
-                raise RuntimeError(f"pi0 response is missing RL-token features: {sorted(result.keys())}")
-            emb = torch.from_numpy(np.array(result["vla_embedding"], dtype=np.float32, copy=True)).to(self.device).unsqueeze(0)
-            valid = torch.from_numpy(np.array(result["vla_embedding_mask"], dtype=np.bool_, copy=True)).to(self.device).unsqueeze(0)
-            self._last_rl_token = self.rl_token_encoder.encode(emb, ~valid).squeeze(0)
+            self._set_rl_token_from_result(result)
         assert pred_action_chunk.shape == (50, 8) # 10,8
         # action = pred_action_chunk[0]
         action = pred_action_chunk[:35]  # 35
@@ -567,10 +643,13 @@ class BasePolicy:
         # For safe position-only residual learning, leave orientation and
         # gripper entirely under the base policy's control. Clone first so
         # logging/training callers do not observe an unexpected in-place edit.
+        base_action = torch.as_tensor(
+            self._last_base_action, dtype=torch.float32, device=self.device
+        ).clone()
         residual_action = residual_action.clone()
         residual_action[..., 3:7] = 0.0
         residual_action[..., 7] = 0.0
-        combined_action = self._last_base_action + residual_action
+        combined_action = base_action + residual_action
         unscaled_combined_action = self.action_scaler.unscale(combined_action)
         self.evaluation = evaluation
         if len(self.base_action_buffer)<1:
@@ -623,6 +702,7 @@ class BasePolicy:
             # print("combined_action    :", unscaled_combined_action)
         
         info = {}
+        info["base_action"] = base_action
         info["scaled_action"] = combined_action
         info["combined_action"] = unscaled_combined_action
         info["residual_action"] = residual_action
@@ -660,7 +740,9 @@ class BasePolicy:
         per_step_dim = torch.as_tensor(self._last_base_action).reshape(-1).shape[0]
         residual = residual_flat.reshape(-1, per_step_dim)  # (H, m)
         H = residual.shape[0]
+        base_parts = []
         combined_parts = []
+        executed_residual_parts = []
         reward_sum = 0.0
         done = False
         info = {}
@@ -669,13 +751,33 @@ class BasePolicy:
             next_obs, r, d, info = self.step(
                 residual_action=residual[h : h + 1], task_prompt=task_prompt, evaluation=evaluation
             )
+            base_parts.append(info["base_action"].reshape(-1))
             combined_parts.append(info["scaled_action"].reshape(-1))  # (m,) scaled
+            executed_residual_parts.append(info["residual_action"].reshape(-1))
             reward_sum += float(r.sum().item())
             if bool(d.any()):
                 done = True
                 break
+        executed_steps = len(combined_parts)
+        executed_base = torch.stack(base_parts, dim=0)
+        executed_combined = torch.stack(combined_parts, dim=0)
+        executed_residual = torch.stack(executed_residual_parts, dim=0)
         while len(combined_parts) < H:  # pad on early termination
             combined_parts.append(combined_parts[-1].clone())
+
+        # The actor chooses one residual chunk from ``next_obs``. Refresh the
+        # VLA token once here so its cadence matches residual decisions rather
+        # than the independently cached 35-step pi0 base-action plan. If the
+        # base policy was replanned on the final environment step, the step
+        # marker makes this a no-op because that inference already returned a
+        # token for the same observation.
+        if not done and self.rl_token_encoder is not None:
+            self.refresh_online_rl_token(task_prompt=task_prompt)
+            token = self._last_rl_token.to(self.device)
+            if token.ndim == 1:
+                token = token.unsqueeze(0)
+            next_obs[self.rl_token_obs_key] = token
+
         combined = torch.stack(combined_parts, dim=0)  # (H, m) scaled
         combined_flat = combined.reshape(1, -1)  # (1, H*m) -> buffer action
         reward = torch.as_tensor([reward_sum], dtype=torch.float32, device=self.device)
@@ -684,6 +786,11 @@ class BasePolicy:
             "scaled_action": combined_flat,  # chunk-level combined action (for buffer)
             "combined_action": self.action_scaler.unscale(combined),  # (H, m) unscaled (for eval plots)
             "residual_action": residual,  # (H, m)
+            # Exact, unpadded actions for per-episode oscillation diagnostics.
+            "executed_steps": executed_steps,
+            "executed_base_action": self.action_scaler.unscale(executed_base),
+            "executed_combined_action": self.action_scaler.unscale(executed_combined),
+            "executed_residual_action": executed_residual,
             "task_prompt": self.text,
         }
         return next_obs, combined_flat, reward, done_t, out_info

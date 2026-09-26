@@ -57,6 +57,7 @@ from resfit.rl_finetuning.utils.rl_token_pipeline import (
     append_embedding_shard,
     artifact_id,
     bottleneck_id,
+    embedding_store_lock,
     encode_all,
     initialize_embedding_store,
     train_or_load_rl_token,
@@ -74,7 +75,14 @@ from resfit.rl_finetuning.config.rlpd import (
     LanguageConfig,
 )
 from resfit.rl_finetuning.utils.normalization import ActionScaler, StateStandardizer
+from resfit.rl_finetuning.utils.action_diagnostics import (
+    save_episode_action_diagnostics,
+)
 from resfit.rl_finetuning.utils.rb_transforms import MultiStepTransform
+from resfit.rl_finetuning.utils.task_success_log import (
+    apply_initial_eval_outcome_overrides,
+    load_initial_eval_outcomes_from_log,
+)
 # from resfit.rl_finetuning.wrappers.residual_env_wrapper import BasePolicyVecEnvWrapper
 from gpt_residual_robot import BasePolicy
 
@@ -123,6 +131,63 @@ class TrainingTimer:
         """Reset all timing data."""
         self.times = defaultdict(list)
         self.reset_time = time.perf_counter()
+
+
+class EpisodeCheckpointCoordinator:
+    """Pause collection at an episode boundary until a checkpoint is durable."""
+
+    def __init__(self):
+        self._condition = threading.Condition()
+        self._requested_step: int | None = None
+        self._completed_step = -1
+        self._failure: BaseException | None = None
+
+    def request_and_wait(self, step: int, stop_event: threading.Event) -> bool:
+        """Request a learner checkpoint and wait until it has been saved."""
+        with self._condition:
+            if self._requested_step is not None:
+                raise RuntimeError(
+                    "A synchronized checkpoint request is already pending at "
+                    f"step {self._requested_step}"
+                )
+            self._requested_step = int(step)
+            self._condition.notify_all()
+            while (
+                self._completed_step < step
+                and self._failure is None
+                and not stop_event.is_set()
+            ):
+                self._condition.wait(timeout=0.5)
+
+            if self._failure is not None:
+                raise RuntimeError(
+                    f"Synchronized checkpoint at step {step} failed"
+                ) from self._failure
+            return self._completed_step >= step
+
+    def requested_step(self) -> int | None:
+        with self._condition:
+            return self._requested_step
+
+    def mark_complete(self, step: int) -> None:
+        with self._condition:
+            if self._requested_step != step:
+                raise RuntimeError(
+                    "Completed synchronized checkpoint does not match request: "
+                    f"requested={self._requested_step}, completed={step}"
+                )
+            self._completed_step = int(step)
+            self._requested_step = None
+            self._condition.notify_all()
+
+    def mark_failed(self, exc: BaseException) -> None:
+        with self._condition:
+            self._failure = exc
+            self._condition.notify_all()
+
+    def wake_waiters(self) -> None:
+        with self._condition:
+            self._condition.notify_all()
 
 
 # -----------------------------------------------------------------------------
@@ -192,7 +257,14 @@ class LanguageEmbedder:
                     normalize_embeddings=True,
                 ).to(self.device).float()
         else:
-            seed = abs(hash(text)) % (2**31 - 1)
+            # Python's built-in hash() is salted independently for every
+            # process, so it cannot be used for an embedding that must remain
+            # compatible with replay caches and resumed checkpoints. Derive a
+            # stable seed from the UTF-8 task text instead.
+            digest = hashlib.sha256(text.encode("utf-8")).digest()
+            seed = int.from_bytes(digest[:8], byteorder="big", signed=False) % (
+                2**31 - 1
+            )
             g = torch.Generator(device="cpu").manual_seed(seed)
             vec = torch.randn(self.emb_dim, generator=g)
             vec = (vec / vec.norm()).to(self.device).float()
@@ -256,6 +328,24 @@ def _inject_task_emb(
     else:
         emb = task_emb
     obs[key] = emb.to(state.device if state is not None else task_emb.device)
+    return obs
+
+
+def _inject_task_id(
+    obs: dict[str, torch.Tensor], task_id: int, key: str = "observation.task_id"
+) -> dict[str, torch.Tensor]:
+    """Attach the discrete routing id using the observation's batch/device."""
+    if obs is None:
+        return obs
+    state = obs.get("observation.state")
+    device = state.device if isinstance(state, torch.Tensor) else None
+    if isinstance(state, torch.Tensor) and state.ndim == 2:
+        value = torch.full(
+            (state.shape[0],), int(task_id), dtype=torch.long, device=device
+        )
+    else:
+        value = torch.tensor(int(task_id), dtype=torch.long, device=device)
+    obs[key] = value
     return obs
 
 
@@ -523,13 +613,36 @@ def load_training_checkpoint(
     # backwards compatibility with checkpoints that pre-date this fix.
     loaded_modules: list[str] = []
     if "agent" in checkpoint:
-        missing, unexpected = agent.load_state_dict(checkpoint["agent"], strict=False)
+        if (
+            getattr(agent, "task_specific_actor", False)
+            and not any(
+                key.startswith("actor.actors.")
+                for key in checkpoint["agent"]
+            )
+        ):
+            raise RuntimeError(
+                "This checkpoint contains one shared actor and cannot be "
+                "resumed as an exact task-specific-actor run. Start a fresh run "
+                "so the new task-id replay schema and optimizer state are built."
+            )
+        missing, unexpected = agent.load_state_dict(
+            checkpoint["agent"],
+            strict=getattr(agent, "task_specific_actor", False),
+        )
         loaded_modules.append("agent (full)")
         if missing:
             print(f"  [load] missing keys (will stay at __init__ values): {len(missing)}")
         if unexpected:
             print(f"  [load] unexpected keys (ignored): {len(unexpected)}")
     else:
+        if (
+            getattr(agent, "task_specific_actor", False)
+            and not any(key.startswith("actors.") for key in checkpoint["actor"])
+        ):
+            raise RuntimeError(
+                "This legacy checkpoint contains one shared actor and cannot "
+                "be exactly resumed with task-specific actors."
+            )
         agent.actor.load_state_dict(checkpoint["actor"])
         loaded_modules.append("actor")
         agent.critic.load_state_dict(checkpoint["critic"])
@@ -621,6 +734,54 @@ def load_training_checkpoint(
     }
 
 
+def _backfill_initial_eval_outcomes(
+    saved_stats: dict,
+    *,
+    task_output_root: str | Path | None,
+    candidate_tasks: list[str],
+    window_size: int,
+) -> tuple[dict, Path | None]:
+    """Migrate scalar-baseline checkpoints using saved step-0 eval outcomes."""
+    if all(
+        saved_stats.get(task, {}).get("initial_eval_outcomes") is not None
+        for task in candidate_tasks
+    ):
+        return saved_stats, None
+    if task_output_root is None:
+        return saved_stats, None
+
+    progress_path = Path(task_output_root) / "step_0" / "evaluation_progress.json"
+    if not progress_path.is_file():
+        return saved_stats, None
+
+    with progress_path.open("r", encoding="utf-8") as handle:
+        progress = json.load(handle)
+    if progress.get("status") != "complete":
+        return saved_stats, None
+    if int(progress.get("eval_num_episode", -1)) != int(window_size):
+        return saved_stats, None
+    if progress.get("candidate_tasks") != candidate_tasks:
+        return saved_stats, None
+
+    outcomes_by_task = progress.get("successes_by_task", {})
+    migrated = copy.deepcopy(saved_stats)
+    for task in candidate_tasks:
+        stats = migrated.get(task)
+        raw_outcomes = outcomes_by_task.get(task)
+        if stats is None or raw_outcomes is None or "initial_success_rate" not in stats:
+            return saved_stats, None
+        if len(raw_outcomes) != window_size or any(
+            value not in (0, 1) for value in raw_outcomes
+        ):
+            return saved_stats, None
+        outcomes = [int(value) for value in raw_outcomes]
+        eval_rate = sum(outcomes) / window_size
+        if abs(eval_rate - float(stats["initial_success_rate"])) > 1e-9:
+            return saved_stats, None
+        stats["initial_eval_outcomes"] = outcomes
+    return migrated, progress_path
+
+
 
 def _add_transitions_to_buffer(
     *,
@@ -705,6 +866,7 @@ def collector_loop(
         episode_queue,
         weights_queue,
         stop_event,
+        checkpoint_sync,
         training_timer,
         run_name,
         outputs_dir,
@@ -716,6 +878,7 @@ def collector_loop(
         initial_global_step=0,
         initial_episode_count=0,
         initial_best_eval_success_rate=-float("inf"),
+        discard_initial_previous_episode=False,
     ):
         global_step = initial_global_step
         if (
@@ -733,62 +896,102 @@ def collector_loop(
         best_eval_success_rate = initial_best_eval_success_rate
 
         task_names = list(base_policy.task_reward_generator.candidate_tasks)
+        task_to_id = {task: index for index, task in enumerate(task_names)}
 
         def _print_eval_success_rates(eval_metrics):
             for index, task in enumerate(task_names, start=1):
                 success_rate = eval_metrics[f"eval/task_{index}/success_rate"]
                 print(f"🎉 task {index} ({task}) success rate: {success_rate}")
 
-        def _update_task_probabilities(completed_task, succeeded):
-            """Log the success rates already updated by TaskRewardGenerator."""
-            if completed_task not in base_policy.task_reward_generator.task_success_stats:
-                logging.warning("Unknown generated task; not logging stats: %s", completed_task)
-                return
-
-            priorities = {
-                task: base_policy.task_reward_generator.get_task_sampling_weight(task)
-                for task in task_names
-            }
-            priority_sum = sum(priorities.values())
-            probabilities = {
-                task: priority / priority_sum
-                for task, priority in priorities.items()
-            }
+        def _task_metrics(completed_task):
+            """Build probability and rolling-rate metrics for one completed task."""
+            probabilities = (
+                base_policy.task_reward_generator.get_task_sampling_probabilities(
+                    task_names
+                )
+            )
 
             task_metrics = {}
             for index, task in enumerate(task_names):
-                stats = base_policy.task_reward_generator.task_success_stats[task]
-                task_metrics[f"tasks/task_{index}_success_rate"] = (
-                    base_policy.task_reward_generator.get_task_success_rate(task)
-                )
                 task_metrics[f"tasks/task_{index}_probability"] = probabilities[task]
-                task_metrics[f"tasks/task_{index}_attempts"] = (
-                    stats["successes"] + stats["failures"] - 2.0
-                )
-            wandb.log(task_metrics, step=global_step)
+                if task == completed_task:
+                    task_episode_count = (
+                        base_policy.task_reward_generator.get_task_attempts(task)
+                    )
+                    task_metrics[f"tasks/task_{index}_success_rate"] = (
+                        base_policy.task_reward_generator.get_task_success_rate(task)
+                    )
+                    task_metrics[f"tasks/task_{index}_episode_count"] = (
+                        task_episode_count
+                    )
+                    # Keep the existing diagnostic metric for compatibility.
+                    task_metrics[f"tasks/task_{index}_attempts"] = task_episode_count
             print(
                 "[collector] task success stats: "
                 f"{base_policy.task_reward_generator.task_success_stats}"
             )
+            return task_metrics
+
+        def _update_task_probabilities(completed_task):
+            """Return metrics for the rate already updated by TaskRewardGenerator."""
+            if completed_task not in base_policy.task_reward_generator.task_success_stats:
+                logging.warning("Unknown generated task; not logging stats: %s", completed_task)
+                return {}
+            return _task_metrics(completed_task)
 
         # obs = base_policy.reset()
-        def _attach_task_emb(obs, task_emb):
-            if not lang_cfg.enabled or task_emb is None or obs is None:
+        def _attach_task_context(obs, task_prompt, task_emb=None):
+            if obs is None:
                 return obs
-            return _inject_task_emb(obs, task_emb, key=lang_cfg.lang_emb_obs_key)
+            if task_prompt not in task_to_id:
+                raise KeyError(f"Unknown task prompt for routing: {task_prompt!r}")
+            if lang_cfg.enabled:
+                if task_emb is None:
+                    raise RuntimeError(
+                        "task_emb is required when language conditioning is enabled"
+                    )
+                _inject_task_emb(obs, task_emb, key=lang_cfg.lang_emb_obs_key)
+            if cfg.agent.task_specific_actor:
+                _inject_task_id(
+                    obs, task_to_id[task_prompt], key=cfg.agent.task_id_obs_key
+                )
+            return obs
         initial_eval_completed = False
+        run_initial_evaluation = bool(
+            getattr(cfg, "eval_enabled", True)
+            and cfg.eval_first
+            and not getattr(cfg, "initial_task_success_log", None)
+            and getattr(cfg, "initial_task_success_window_overrides", None) is None
+            and global_step == 0
+        )
+        if not getattr(cfg, "eval_enabled", True):
+            print("[collector] robot evaluation is disabled for this run")
         previous_residual_last = None
-        if cfg.eval_first and global_step == 0:
+        save_episode_action_plots = bool(
+            getattr(cfg, "save_episode_action_plots", False)
+        )
+        action_diagnostics_dir = Path(outputs_dir) / "action_diagnostics" / "training"
+        diagnostic_base_actions = []
+        diagnostic_residual_actions = []
+        diagnostic_combined_actions = []
+        diagnostic_start_global_step = None
+        if run_initial_evaluation:
             # Initial evaluation performs its own task-specific resets. Avoid a
             # normal reset here, which would generate an unused random task.
             obs = None
             task_prompt = None
             task_emb = None
         else:
-            base_policy.task_reward_generator.set_output_cycle(global_step)
-            obs, task_prompt = base_policy.reset()
+            base_policy.task_reward_generator.set_output_training(global_step)
+            # A freshly collected replay warmup may end with an unfinished
+            # random-policy episode.  Do not score that episode as the first
+            # learned-policy result.  Cached warmup/replay and resumed runs do
+            # not leave such a pending robot episode in this process.
+            obs, task_prompt = base_policy.reset(
+                evaluate_previous=not discard_initial_previous_episode
+            )
             task_emb = lang_embedder(task_prompt) if lang_embedder is not None else None
-            obs = _attach_task_emb(obs, task_emb)
+            obs = _attach_task_context(obs, task_prompt, task_emb)
         agent = _make_agent(cfg, obs_shape=(img_c, img_h, img_w),
                             prop_shape=(lowdim_dim,),
                             action_dim=action_dim,
@@ -796,6 +999,13 @@ def collector_loop(
                             cfg=cfg.agent,
                             residual_actor=True,  # Enable residual actor mode
                         ) 
+        checkpoint_interval = int(cfg.checkpoint_interval)
+        if checkpoint_interval <= 0:
+            raise ValueError("checkpoint_interval must be positive")
+        next_checkpoint_threshold = (
+            global_step // checkpoint_interval + 1
+        ) * checkpoint_interval
+
         def _try_load_latest_weights():
             latest = None
             while True:
@@ -820,9 +1030,10 @@ def collector_loop(
             episode_steps = []
             episode_done = False
             episode_task_prompt = task_prompt
+            episode_wandb_metrics = {}
             
             while not episode_done and global_step <= cfg.algo.total_timesteps and (not stop_event.is_set()) and len(episode_steps)<cfg.send_transitions_len:
-                if cfg.eval_first and global_step == 0 and not initial_eval_completed:
+                if run_initial_evaluation and not initial_eval_completed:
                     # 在训练开始前先 eval 一次，看看 base policy 的表现
                     pre_eval_task_success_stats = copy.deepcopy(
                         base_policy.task_reward_generator.task_success_stats
@@ -832,7 +1043,7 @@ def collector_loop(
                             eval_metrics = run_franka_evaluation(
                                 env=base_policy,  ## todo eval?
                                 agent=agent,
-                                eval_num_episode=cfg.eval_num_episodes,
+                                eval_num_episode=cfg.task_success_window_size,
                                 device=device,
                                 global_step=global_step,
                                 save_video=cfg.save_video,
@@ -842,6 +1053,7 @@ def collector_loop(
                                 lang_cfg = lang_cfg,
                                 lang_embedder= lang_embedder,
                                 chunk_len=cfg.chunk_len,  ##################
+                                initialize_task_success_metrics=True,
                             )
 
                             _print_eval_success_rates(eval_metrics)
@@ -849,9 +1061,18 @@ def collector_loop(
                         base_policy.task_reward_generator.restore_task_success_stats(
                             pre_eval_task_success_stats
                         )
+                    initial_eval_outcomes = eval_metrics["_eval_outcomes_by_task"]
+                    base_policy.task_reward_generator.initialize_task_success_windows(
+                        initial_eval_outcomes
+                    )
+                    print(
+                        "[collector] initialized task success-rate rolling windows "
+                        f"with the ordered outcomes from "
+                        f"{cfg.task_success_window_size} evaluation episodes per task"
+                    )
                     obs, task_prompt = base_policy.reset(evaluate_previous=False)
                     task_emb = lang_embedder(task_prompt) if lang_embedder is not None else None
-                    obs = _attach_task_emb(obs, task_emb)
+                    obs = _attach_task_context(obs, task_prompt, task_emb)
                     episode_task_prompt = task_prompt
                     initial_eval_completed = True
                     previous_residual_last = None
@@ -887,19 +1108,33 @@ def collector_loop(
                     -1, info["residual_action"].shape[-1]
                 )
                 previous_residual_last = current_residual[-1].clone()
+
+                if save_episode_action_plots:
+                    if diagnostic_start_global_step is None:
+                        diagnostic_start_global_step = global_step
+                    diagnostic_base_actions.append(
+                        info["executed_base_action"].detach().cpu().numpy()
+                    )
+                    diagnostic_residual_actions.append(
+                        info["executed_residual_action"].detach().cpu().numpy()
+                    )
+                    diagnostic_combined_actions.append(
+                        info["executed_combined_action"].detach().cpu().numpy()
+                    )
                 
                 if done:
                     task_prompt = info["task_prompt"]
                     task_emb = lang_embedder(task_prompt) if lang_embedder is not None else None
-                next_obs = _attach_task_emb(next_obs, task_emb)
+                next_obs = _attach_task_context(next_obs, task_prompt, task_emb)
                 if done.any():
                     episode_count += done.float().sum().item()
                     episode_done = True
 
                     terminal_reward = float(reward.sum().item())
-                    _update_task_probabilities(
-                        completed_task=episode_task_prompt,
-                        succeeded=terminal_reward > 0.5,
+                    episode_wandb_metrics.update(
+                        _update_task_probabilities(
+                            completed_task=episode_task_prompt,
+                        )
                     )
                     previous_residual_last = None
 
@@ -907,7 +1142,49 @@ def collector_loop(
                     _log = {"training/reward": terminal_reward}  ##################
                     if getattr(agent, "last_rollout_gate_adopt_rate", None) is not None:
                         _log["rollout/gate_adopt_rate"] = agent.last_rollout_gate_adopt_rate
-                    wandb.log(_log, step=global_step)  ##################
+                    episode_wandb_metrics.update(_log)
+
+                    if save_episode_action_plots:
+                        try:
+                            base_actions = np.concatenate(
+                                diagnostic_base_actions, axis=0
+                            )
+                            residual_actions = np.concatenate(
+                                diagnostic_residual_actions, axis=0
+                            )
+                            combined_actions = np.concatenate(
+                                diagnostic_combined_actions, axis=0
+                            )
+                            executed_episode_steps = len(base_actions)
+                            png_path, csv_path = save_episode_action_diagnostics(
+                                output_dir=action_diagnostics_dir,
+                                episode_number=int(episode_count),
+                                task_prompt=episode_task_prompt,
+                                start_global_step=int(diagnostic_start_global_step),
+                                end_global_step=(
+                                    int(diagnostic_start_global_step)
+                                    + executed_episode_steps
+                                    - 1
+                                ),
+                                base_actions=base_actions,
+                                residual_actions=residual_actions,
+                                combined_actions=combined_actions,
+                            )
+                            print(
+                                "[collector] saved episode action diagnostics: "
+                                f"{png_path} and {csv_path}"
+                            )
+                        except Exception:
+                            logging.exception(
+                                "Failed to save action diagnostics for training "
+                                "episode %s",
+                                int(episode_count),
+                            )
+                        finally:
+                            diagnostic_base_actions.clear()
+                            diagnostic_residual_actions.clear()
+                            diagnostic_combined_actions.clear()
+                            diagnostic_start_global_step = None
                     # wandb.log(
                     #     {
                     #         "training/reward": reward
@@ -928,12 +1205,18 @@ def collector_loop(
                 episode_steps.append(step_payload)  # append 一步
                 obs = next_obs
 
+            # Count completed environment steps before publishing the payload.
+            # This makes checkpoint/global_step mean "steps already processed",
+            # so a resumed collector starts with the following step.
+            global_step += len(episode_steps) * cfg.chunk_len
+
             # 每收集一步就发给 learner
             ep_payload = {
                 "episode_idx": episode_idx,
                 "global_step_after_episode": global_step,
                 "episode_count": episode_count,
                 "steps": episode_steps,
+                "wandb_metrics": episode_wandb_metrics,
             }
 
             
@@ -941,8 +1224,29 @@ def collector_loop(
             print(f"[collector] pushed episode {episode_idx}, len={len(episode_steps)}, global_step={global_step}")
 
             episode_idx += 1
+            if episode_done and global_step >= next_checkpoint_threshold:
+                crossed_threshold = next_checkpoint_threshold
+                print(
+                    "[collector] checkpoint threshold "
+                    f"{crossed_threshold} reached; episode ended at step "
+                    f"{global_step}. Waiting for learner alignment and save."
+                )
+                checkpoint_saved = checkpoint_sync.request_and_wait(
+                    global_step, stop_event
+                )
+                if not checkpoint_saved:
+                    break
+                print(
+                    "[collector] synchronized checkpoint saved at step "
+                    f"{global_step}; collection continuing"
+                )
+                next_checkpoint_threshold = (
+                    global_step // checkpoint_interval + 1
+                ) * checkpoint_interval
+
             periodic_eval_due = (
-                global_step > 0
+                getattr(cfg, "eval_enabled", True)
+                and global_step > 0
                 and global_step % cfg.eval_interval_every_steps == 0
             )
             if periodic_eval_due:
@@ -973,15 +1277,13 @@ def collector_loop(
                     )
                 obs, task_prompt = base_policy.reset(evaluate_previous=False)
                 task_emb = lang_embedder(task_prompt) if lang_embedder is not None else None
-                obs = _attach_task_emb(obs, task_emb)
+                obs = _attach_task_context(obs, task_prompt, task_emb)
                 previous_residual_last = None
             # 原来 eval 后会 reset，这里 episode 结束也 reset
             # obs = base_policy.reset()
             
-            # global_step += cfg.send_transitions_len
-            # Each collected transition spans one chunk = chunk_len env steps.
-            global_step += cfg.send_transitions_len * cfg.chunk_len  ##################
         stop_event.set()
+        checkpoint_sync.wake_waiters()
         print("[collector] finished")
 
 
@@ -997,6 +1299,7 @@ def learner_loop(
         episode_queue,
         weights_queue,
         stop_event,
+        checkpoint_sync,
         model_save_dir,
         run_name,
         task_output_root,
@@ -1050,10 +1353,58 @@ def learner_loop(
             except Exception:
                 pass
             weights_queue.put(payload)
+
+        def _save_requested_checkpoint() -> bool:
+            """Save only after learner and collector reach the same boundary."""
+            requested_step = checkpoint_sync.requested_step()
+            if requested_step is None or global_step < requested_step:
+                return False
+            if not episode_queue.empty():
+                return False
+            if global_step != requested_step:
+                error = RuntimeError(
+                    "Learner passed the synchronized checkpoint boundary: "
+                    f"requested={requested_step}, learner={global_step}"
+                )
+                checkpoint_sync.mark_failed(error)
+                stop_event.set()
+                raise error
+
+            ckpt_path = model_save_dir / f"checkpoint_{requested_step}.pt"
+            try:
+                save_training_checkpoint(
+                    ckpt_path=ckpt_path,
+                    agent=agent,
+                    online_rb=online_rb,
+                    global_step=requested_step,
+                    best_eval_success_rate=best_eval_success_rate,
+                    training_cum_time=training_cum_time,
+                    episode_count=episode_count,
+                    actor_updates=actor_updates,
+                    run_name=run_name,
+                    task_output_root=task_output_root,
+                    task_success_stats=task_success_stats,
+                    cfg=cfg,
+                    save_replay_buffer=cfg.save_replay_on_checkpoint,
+                )
+            except BaseException as exc:
+                checkpoint_sync.mark_failed(exc)
+                stop_event.set()
+                raise
+
+            checkpoint_sync.mark_complete(requested_step)
+            print(
+                "[learner] collector/learner aligned and checkpoint saved at "
+                f"episode boundary step {requested_step}"
+            )
+            return True
         
         len_rb = len(online_rb)
         while (not stop_event.is_set()) or (not episode_queue.empty()):
             iter_start = time.time()
+
+            if _save_requested_checkpoint():
+                continue
 
             # --------------------------------------------------------------
             # (A) 接收 collector 发来的 episode
@@ -1068,6 +1419,7 @@ def learner_loop(
             got_episode = True
             episode_count = ep_payload["episode_count"]
             global_step = max(global_step, ep_payload["global_step_after_episode"])
+            wandb_step_metrics = dict(ep_payload.get("wandb_metrics") or {})
 
             steps = ep_payload["steps"]
             for st in steps:
@@ -1222,7 +1574,21 @@ def learner_loop(
 
                     log_dict["train/residual_l1_magnitude"] = residual_l1_magnitude
                     log_dict["train/residual_l2_magnitude"] = residual_l2_magnitude
-                    log_dict["histograms/residual_actions"] = wandb.Histogram(actions.numpy().reshape(-1))
+                    if actions.shape[-1] % cfg.chunk_len != 0:
+                        raise ValueError(
+                            f"Actor action dimension {actions.shape[-1]} is not "
+                            f"divisible by chunk_len={cfg.chunk_len}"
+                        )
+                    action_per_step_dim = actions.shape[-1] // cfg.chunk_len
+                    actions_per_step = actions.reshape(
+                        -1, cfg.chunk_len, action_per_step_dim
+                    )
+                    log_dict["histograms/residual_actions_xyz"] = wandb.Histogram(
+                        actions_per_step[..., :3].numpy().reshape(-1)
+                    )
+                    log_dict["histograms/residual_actions_quaternion"] = wandb.Histogram(
+                        actions_per_step[..., 3:7].numpy().reshape(-1)
+                    )
 
                 if "_target_q" in metrics:
                     target_q = metrics["_target_q"]
@@ -1234,36 +1600,24 @@ def learner_loop(
                         last_sigma.detach().cpu().numpy().reshape(-1)
                     )
 
-                wandb.log(log_dict, step=global_step)
+                wandb_step_metrics.update(log_dict)
 
                 print(f"[learner {global_step}] critic_loss={metrics.get('train/critic_loss', -1):.4f}")
 
-            # --------------------------------------------------------------
-            # (D) Checkpoint
-            # --------------------------------------------------------------
-            if global_step > 0 and global_step % cfg.checkpoint_interval == 0:
-                ckpt_path = model_save_dir / f"checkpoint_{global_step}.pt"
-                save_training_checkpoint(
-                    ckpt_path=ckpt_path,
-                    agent=agent,
-                    online_rb=online_rb,
-                    global_step=global_step,
-                    best_eval_success_rate=best_eval_success_rate,
-                    training_cum_time=training_cum_time,
-                    episode_count=episode_count,
-                    actor_updates=actor_updates,
-                    run_name=run_name,
-                    task_output_root=task_output_root,
-                    task_success_stats=task_success_stats,
-                    cfg=cfg,
-                    save_replay_buffer=cfg.save_replay_on_checkpoint,
-                )
+            # Collector-side episode metrics are written here so W&B steps
+            # follow the same ordered stream that the learner consumes.
+            if wandb_step_metrics:
+                wandb.log(wandb_step_metrics, step=global_step)
+
+            # The collector stops producing data after its episode-boundary
+            # request, so this saves only once the learner has drained through
+            # that exact step.
+            _save_requested_checkpoint()
 
             if global_step >= cfg.algo.total_timesteps and episode_queue.empty():
                 stop_event.set()
                 break
                 
-            global_step +=1
 
         print("[learner] finished")
 
@@ -1347,7 +1701,38 @@ def main(cfg: ResidualTD3DexmgConfig):
         # Hardware is connected immediately before online warmup/rollout.
         connect_robot=not cfg.rl_token.enabled,
         save_images=cfg.save_images,
+        candidate_tasks=cfg.candidate_tasks,
+        success_rate_window_size=cfg.task_success_window_size,
+        min_task_sample_probability=cfg.min_task_sample_probability,
+        prioritize_low_success_tasks=cfg.prioritize_low_success_tasks,
     )
+    task_names = list(base_policy.task_reward_generator.candidate_tasks)
+    task_to_id = {task: index for index, task in enumerate(task_names)}
+    if len(task_to_id) != len(task_names):
+        raise ValueError("candidate_tasks must be unique for task-specific routing")
+    print(
+        "Task sampling mode: "
+        + (
+            "low-success priority"
+            if cfg.prioritize_low_success_tasks
+            else "uniform random (no low-success priority ablation)"
+        )
+    )
+    cfg.agent.task_specific_actor = bool(
+        getattr(cfg, "task_specific_actor", True)
+    )
+    cfg.agent.num_tasks = len(task_names)
+    if cfg.agent.task_specific_actor and cfg.agent.num_tasks < 2:
+        raise ValueError(
+            "task-specific actor routing requires at least two candidate tasks"
+        )
+    print(
+        "Task-specific actor routing with shared critic: "
+        f"{'enabled' if cfg.agent.task_specific_actor else 'disabled'} "
+        f"for {cfg.agent.num_tasks} tasks"
+    )
+    if cfg.candidate_tasks is not None:
+        print(f"Configured candidate tasks: {cfg.candidate_tasks}")
     print(
         "Image artifact saving: "
         f"{'enabled' if cfg.save_images else 'disabled'} "
@@ -1430,85 +1815,115 @@ def main(cfg: ResidualTD3DexmgConfig):
         lowdim_keys = ["observation.state", "observation.base_action", lang_cfg.lang_emb_obs_key]
     else:
         lang_embedder = None
-        dataset_task_prompts = {}
+        dataset_task_prompts = _load_lerobot_task_prompts(
+            dataset, cfg.offline_data.name
+        )
         lowdim_keys = ["observation.state", "observation.base_action"]
+
+    if cfg.agent.task_specific_actor:
+        lowdim_keys.append(cfg.agent.task_id_obs_key)
 
     # RL-Token stages must finish before any replay-cache lookup: old image
     # buffers and buffers produced by a different bottleneck are incompatible.
     offline_rl_tokens = None
+    embedding_store = None
     rl_token_id = None
     if cfg.rl_token.enabled:
         dataset_task_prompts = _load_lerobot_task_prompts(dataset, cfg.offline_data.name)
-        rl_token_id = artifact_id(cfg.offline_data.name, cfg.offline_data.num_episodes, cfg.rl_token)
-        artifact_root = _CACHE_ROOT / cfg.rl_token.embedding_cache_dir / rl_token_id
-        if cfg.offline_data.num_episodes is None:
-            expected_embedding_frames = dataset.meta.total_frames
-        else:
-            expected_embedding_frames = sum(
-                dataset.meta.episodes[ep_idx]["length"]
-                for ep_idx in range(min(cfg.offline_data.num_episodes, dataset.meta.total_episodes))
-            )
-        embedding_store = initialize_embedding_store(
-            artifact_root,
-            expected_embedding_frames,
-            cfg.rl_token.embedding_storage_dtype,
-            reset=cfg.rl_token.force_recollect_embeddings,
+        embedding_id = artifact_id(
+            cfg.offline_data.name, cfg.offline_data.num_episodes, cfg.rl_token
         )
-        print(
-            f"Loaded disk embedding store: {len(embedding_store)}/{expected_embedding_frames} "
-            f"frames, complete={embedding_store.complete}"
-        )
-        if not embedding_store.complete:
-            loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
-            resume_index = len(embedding_store)
-            shard_embeddings, shard_masks, shard_episode_ids = [], [], []
-            completed = False
-            progress = tqdm(
-                total=expected_embedding_frames,
-                initial=resume_index,
-                desc="Collecting frozen pi0 embeddings",
-            )
-            try:
-                for sample_index, sample in enumerate(loader):
-                    if sample_index < resume_index:
-                        continue
-                    ep_idx = int(sample["episode_index"].item())
-                    if cfg.offline_data.num_episodes is not None and ep_idx >= cfg.offline_data.num_episodes:
-                        break
-                    raw_obs = {k: sample[k].to(device) for k in sample if any(
-                        name in k for name in ("exterior_image_1_left", "exterior_image_2_left",
-                                               "wrist_image_left", "eef_position", "gripper_position")
-                    )}
-                    task_idx = int(sample["task_index"].item())
-                    embedding, mask = base_policy.get_offline_vla_embedding(
-                        raw_obs, dataset_task_prompts[task_idx]
-                    )
-                    shard_embeddings.append(embedding.cpu())
-                    shard_masks.append(mask.cpu())
-                    shard_episode_ids.append(ep_idx)
-                    progress.update(1)
-                    if len(shard_embeddings) >= cfg.rl_token.embedding_shard_size:
-                        embedding_store = append_embedding_shard(
-                            artifact_root, shard_embeddings, shard_masks, shard_episode_ids
-                        )
-                        shard_embeddings, shard_masks, shard_episode_ids = [], [], []
-                completed = len(embedding_store) + len(shard_embeddings) == expected_embedding_frames
-            finally:
-                progress.close()
-                embedding_store = append_embedding_shard(
-                    artifact_root,
-                    shard_embeddings,
-                    shard_masks,
-                    shard_episode_ids,
-                    complete=completed,
-                )
-            if not completed:
-                raise RuntimeError(
-                    f"Embedding collection stopped at {len(embedding_store)}/{expected_embedding_frames} frames"
-                )
-        rl_token_id = bottleneck_id(rl_token_id, cfg.rl_token)
+        rl_token_id = bottleneck_id(embedding_id, cfg.rl_token)
         bottleneck_root = _CACHE_ROOT / cfg.rl_token.checkpoint_dir / rl_token_id
-        rl_token_encoder = train_or_load_rl_token(embedding_store, cfg.rl_token, bottleneck_root, device)
+        bottleneck_checkpoint = bottleneck_root / "rl_token.pt"
+        load_trained_bottleneck = (
+            bottleneck_checkpoint.exists()
+            and not cfg.rl_token.force_retrain
+            and not cfg.rl_token.force_recollect_embeddings
+        )
+
+        if load_trained_bottleneck:
+            print(
+                "Loading trained RL-token checkpoint without initializing the "
+                f"offline embedding cache: {bottleneck_checkpoint}"
+            )
+            rl_token_encoder = train_or_load_rl_token(
+                None, cfg.rl_token, bottleneck_root, device
+            )
+        else:
+            artifact_root = _CACHE_ROOT / cfg.rl_token.embedding_cache_dir / embedding_id
+            if cfg.offline_data.num_episodes is None:
+                expected_embedding_frames = dataset.meta.total_frames
+            else:
+                expected_embedding_frames = sum(
+                    dataset.meta.episodes[ep_idx]["length"]
+                    for ep_idx in range(min(cfg.offline_data.num_episodes, dataset.meta.total_episodes))
+                )
+            # Hold the lock through both collection and VAE training because
+            # the latter streams shards from this store. A concurrent reset
+            # would otherwise invalidate data while the model is reading it.
+            with embedding_store_lock(artifact_root):
+                embedding_store = initialize_embedding_store(
+                    artifact_root,
+                    expected_embedding_frames,
+                    cfg.rl_token.embedding_storage_dtype,
+                    reset=cfg.rl_token.force_recollect_embeddings,
+                )
+                print(
+                    f"Loaded disk embedding store: {len(embedding_store)}/{expected_embedding_frames} "
+                    f"frames, complete={embedding_store.complete}"
+                )
+                if not embedding_store.complete:
+                    loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
+                    resume_index = len(embedding_store)
+                    shard_embeddings, shard_masks, shard_episode_ids = [], [], []
+                    completed = False
+                    progress = tqdm(
+                        total=expected_embedding_frames,
+                        initial=resume_index,
+                        desc="Collecting frozen pi0 embeddings",
+                    )
+                    try:
+                        for sample_index, sample in enumerate(loader):
+                            if sample_index < resume_index:
+                                continue
+                            ep_idx = int(sample["episode_index"].item())
+                            if cfg.offline_data.num_episodes is not None and ep_idx >= cfg.offline_data.num_episodes:
+                                break
+                            raw_obs = {k: sample[k].to(device) for k in sample if any(
+                                name in k for name in ("exterior_image_1_left", "exterior_image_2_left",
+                                                       "wrist_image_left", "eef_position", "gripper_position")
+                            )}
+                            task_idx = int(sample["task_index"].item())
+                            embedding, mask = base_policy.get_offline_vla_embedding(
+                                raw_obs, dataset_task_prompts[task_idx]
+                            )
+                            shard_embeddings.append(embedding.cpu())
+                            shard_masks.append(mask.cpu())
+                            shard_episode_ids.append(ep_idx)
+                            progress.update(1)
+                            if len(shard_embeddings) >= cfg.rl_token.embedding_shard_size:
+                                embedding_store = append_embedding_shard(
+                                    artifact_root, shard_embeddings, shard_masks, shard_episode_ids
+                                )
+                                shard_embeddings, shard_masks, shard_episode_ids = [], [], []
+                        completed = len(embedding_store) + len(shard_embeddings) == expected_embedding_frames
+                    finally:
+                        progress.close()
+                        embedding_store = append_embedding_shard(
+                            artifact_root,
+                            shard_embeddings,
+                            shard_masks,
+                            shard_episode_ids,
+                            complete=completed,
+                        )
+                    if not completed:
+                        raise RuntimeError(
+                            f"Embedding collection stopped at {len(embedding_store)}/{expected_embedding_frames} frames"
+                        )
+                rl_token_encoder = train_or_load_rl_token(
+                    embedding_store, cfg.rl_token, bottleneck_root, device
+                )
         # Do not eagerly encode the complete offline dataset here.  The
         # serialized replay buffer already contains ``observation.rl_token``;
         # when that buffer cache exists, encoding every VLA embedding again is
@@ -1517,6 +1932,8 @@ def main(cfg: ResidualTD3DexmgConfig):
         base_policy.set_rl_token_encoder(rl_token_encoder, cfg.rl_token.obs_key)
         image_keys = [cfg.rl_token.obs_key]
         lowdim_keys = ["observation.state", "observation.base_action"]
+        if cfg.agent.task_specific_actor:
+            lowdim_keys.append(cfg.agent.task_id_obs_key)
 
     # ---------------------------------------------------------------------
     # Networks ------------------------------------------------------------
@@ -1530,10 +1947,20 @@ def main(cfg: ResidualTD3DexmgConfig):
         residual_actor=True,  # Enable residual actor mode
     ) 
     
-    def _attach_task_emb(obs, task_emb):
-        if not lang_cfg.enabled or task_emb is None or obs is None:
+    def _attach_task_context(obs, task_prompt, task_emb=None):
+        if obs is None:
             return obs
-        return _inject_task_emb(obs, task_emb, key=lang_cfg.lang_emb_obs_key)
+        if task_prompt not in task_to_id:
+            raise KeyError(f"Unknown task prompt for routing: {task_prompt!r}")
+        if lang_cfg.enabled:
+            if task_emb is None:
+                raise RuntimeError("task_emb is required when language conditioning is enabled")
+            _inject_task_emb(obs, task_emb, key=lang_cfg.lang_emb_obs_key)
+        if cfg.agent.task_specific_actor:
+            _inject_task_id(
+                obs, task_to_id[task_prompt], key=cfg.agent.task_id_obs_key
+            )
+        return obs
 
     # horizon = env.vec_env.metadata["horizon"]  # todo
     horizon = cfg.offline_data.horizon
@@ -1593,8 +2020,22 @@ def main(cfg: ResidualTD3DexmgConfig):
         # next observation still contained a single m-dimensional action.
         # v3 also guarantees RL tokens are stored as (token_dim,) per
         # transition. v2 online caches accidentally retained only token[0].
-        "storage": "chunk_v4_prev_residual_boundary",
+        "storage": "chunk_v6_discrete_task_id",
+        "task_routing": {
+            "enabled": cfg.agent.task_specific_actor,
+            "task_id_obs_key": cfg.agent.task_id_obs_key,
+            "candidate_tasks": task_names,
+        },
+        # Task sampling changes which warmup transitions enter this cache, so
+        # the random-sampling ablation must not reuse an adaptive cache.
+        "prioritize_low_success_tasks": cfg.prioritize_low_success_tasks,
         "temporal_boundary_context": "prev_residual_last_v1",
+        # Online RL tokens are refreshed at the same macro-step cadence as the
+        # residual actor. Old caches reused one token for the 35-step pi0 base
+        # plan and are not temporally compatible.
+        "rl_token_refresh": (
+            "residual_chunk_boundary_v1" if cfg.rl_token.enabled else "disabled"
+        ),
         "gripper_filter": {
             "close_threshold": base_policy.args.gripper_close_threshold,
             "open_threshold": base_policy.args.gripper_open_threshold,
@@ -1607,6 +2048,7 @@ def main(cfg: ResidualTD3DexmgConfig):
         "batch_size": online_batch_size,
         # Include random action noise scale to prevent mixing data from different noise levels
         "random_action_noise_scale": cfg.algo.random_action_noise_scale,
+        "actor_action_scale": cfg.agent.actor.action_scale,
         # Normalization parameters for consistency
         "min_action_range": cfg.offline_data.min_action_range,
         "min_state_std": cfg.offline_data.min_state_std,
@@ -1747,8 +2189,11 @@ def main(cfg: ResidualTD3DexmgConfig):
 
         Returns the number of transitions added.
         """
-        if use_base_policy_for_base_actions and base_policy is None:
-            raise ValueError("base_policy must be provided when use_base_policy_for_base_actions=True")
+        if (use_base_policy_for_base_actions or cfg.rl_token.enabled) and base_policy is None:
+            raise ValueError(
+                "base_policy must be provided when base actions or RL tokens "
+                "are generated from the VLA policy"
+            )
 
         # Populate buffer from pre-loaded dataset
         # print("Populating offline buffer from dataset...")
@@ -1777,12 +2222,35 @@ def main(cfg: ResidualTD3DexmgConfig):
             if num_episodes is not None and ep_idx >= num_episodes:  ##################
                 break
 
+            if "task_index" not in sample:
+                raise KeyError(
+                    "Dataset sample is missing 'task_index'; cannot route "
+                    "task-specific actors"
+                )
+            dataset_task_index = int(sample["task_index"].item())
+            if dataset_task_index not in dataset_task_prompts:
+                raise KeyError(
+                    f"task_index={dataset_task_index} was not found in tasks.jsonl "
+                    f"(available: {sorted(dataset_task_prompts)})"
+                )
+            task_prompt = dataset_task_prompts[dataset_task_index]
+            if task_prompt not in task_to_id:
+                raise KeyError(
+                    f"Offline task {task_prompt!r} is not in candidate_tasks; "
+                    "task-specific routing requires one shared task ordering"
+                )
+            routed_task_id = task_to_id[task_prompt]
+
             if previous_ep_idx is None or ep_idx != previous_ep_idx:
                 if use_base_policy_for_base_actions:
                     stale_actions = len(base_policy.base_action_buffer)
                     base_policy.base_action_buffer.clear()
                     base_policy._last_base_action = None
                     base_policy._last_rl_token = None
+                    # Dataset trajectories are independent episodes. Let the
+                    # first observation initialize the persistent gripper latch
+                    # instead of carrying the previous trajectory's state.
+                    base_policy.reset_gripper_filter_state()
                     base_policy.pi05_client.reset()
                     print(
                         f"[offline episode {ep_idx}] cleared {stale_actions} buffered "
@@ -1811,21 +2279,31 @@ def main(cfg: ResidualTD3DexmgConfig):
                 frame_idx = int(sample["frame_index"].item())
                 print(f"episode {ep_idx} done at frame {frame_idx}")
 
+            # Both base-action inference and streaming RL-token encoding need
+            # the raw VLA observation. Build it once for the current frame.
+            raw_obs = None
+            if use_base_policy_for_base_actions or cfg.rl_token.enabled:
+                raw_obs = {
+                    k: sample[k].to(device)
+                    for k in sample
+                    if any(
+                        name in k
+                        for name in (
+                            "exterior_image_1_left",
+                            "exterior_image_2_left",
+                            "wrist_image_left",
+                            "eef_position",
+                            "gripper_position",
+                        )
+                    )
+                }
+
             # Generate base action based on the selected mode
             if use_base_policy_for_base_actions:
-                # Use base policy to generate base action from current observation
-                # Build raw observation first for base policy inference
-                raw_obs = {}
-                for k in sample:
-                    if "exterior_image_1_left" in k or "wrist_image_left" in k or "exterior_image_2_left" in k or "eef_position" in k or "gripper_position" in k:
-                        raw_obs[k] = sample[k].to(device)  # Keep batch dimension for base policy
-
                 # Get base action from base policy
                 with torch.no_grad():
                     # base_action = base_policy.select_action(raw_obs)
                     # _, base_action, _, _, _ = base_policy.get_obs_and_base_action(raw_obs=raw_obs)  # todo done
-                    task_index = int(sample["task_index"].item())
-                    task_prompt = dataset_task_prompts[task_index]
                     base_action = base_policy.get_offline_action_base(raw_obs, task_prompt)  # base_action shape:(8,)
                 base_action = torch.as_tensor(base_action, dtype=torch.float32)
                 # base_action_scaled = action_scaler.scale(base_action.cpu())
@@ -1844,11 +2322,27 @@ def main(cfg: ResidualTD3DexmgConfig):
                 "gt": gt_action_scaled,              # (m,)
                 "reward": float(done_flag),         # sparse terminal reward
                 "done": done_flag,
+                "task_id": routed_task_id,
             }
             if cfg.rl_token.enabled:
-                if offline_rl_tokens is None or step_id >= len(offline_rl_tokens):
-                    raise IndexError("RL-token cache is shorter than the offline dataset")
-                frame[cfg.rl_token.obs_key] = offline_rl_tokens[step_id]
+                if offline_rl_tokens is not None:
+                    if step_id >= len(offline_rl_tokens):
+                        raise IndexError("RL-token cache is shorter than the offline dataset")
+                    rl_token = offline_rl_tokens[step_id]
+                else:
+                    # A trained bottleneck can encode each VLA embedding as it
+                    # arrives. Discarding the high-dimensional embedding here
+                    # avoids recreating the full disk embedding cache merely
+                    # to build a missing replay buffer.
+                    embedding, valid = base_policy.get_offline_vla_embedding(
+                        raw_obs, task_prompt
+                    )
+                    with torch.no_grad():
+                        rl_token = rl_token_encoder.encode(
+                            embedding.unsqueeze(0).to(device),
+                            ~valid.unsqueeze(0).to(device),
+                        ).squeeze(0).cpu()
+                frame[cfg.rl_token.obs_key] = rl_token
                 step_id += 1
             img = {}
             ##################
@@ -1881,14 +2375,6 @@ def main(cfg: ResidualTD3DexmgConfig):
             if lang_cfg.enabled:
                 if lang_embedder is None:
                     raise RuntimeError("lang_embedder must be initialized when language is enabled")
-                if "task_index" not in sample:
-                    raise KeyError("Dataset sample is missing 'task_index'; cannot build task embedding")
-                task_index = int(sample["task_index"].item())
-                if task_index not in dataset_task_prompts:
-                    raise KeyError(
-                        f"task_index={task_index} was not found in tasks.jsonl "
-                        f"(available: {sorted(dataset_task_prompts)})"
-                    )
         #         task_prompt = dataset_task_prompts[task_index]
         #         curr_task_emb = lang_embedder(task_prompt)
         #         curr_obs[lang_cfg.lang_emb_obs_key] = curr_task_emb.detach().cpu()
@@ -1939,7 +2425,7 @@ def main(cfg: ResidualTD3DexmgConfig):
         # print(f"Added {transitions} transitions")
 
         ##################
-                frame[lang_cfg.lang_emb_obs_key] = lang_embedder(dataset_task_prompts[task_index]).detach().cpu()
+                frame[lang_cfg.lang_emb_obs_key] = lang_embedder(task_prompt).detach().cpu()
 
             episodes[ep_idx].append(frame)
 
@@ -1972,6 +2458,13 @@ def main(cfg: ResidualTD3DexmgConfig):
                 R = sum((cfg.algo.gamma ** h) * frames[t + h]["reward"] for h in range(n))
                 cur_obs = {"observation.state": frames[t]["state"], "observation.base_action": base_chunk}
                 next_obs = {"observation.state": frames[nt]["state"], "observation.base_action": next_base_chunk}
+                if cfg.agent.task_specific_actor:
+                    cur_obs[cfg.agent.task_id_obs_key] = torch.tensor(
+                        frames[t]["task_id"], dtype=torch.long
+                    )
+                    next_obs[cfg.agent.task_id_obs_key] = torch.tensor(
+                        frames[nt]["task_id"], dtype=torch.long
+                    )
                 for k in image_keys:
                     cur_obs[k] = frames[t][k]
                     next_obs[k] = frames[nt][k]
@@ -2024,7 +2517,12 @@ def main(cfg: ResidualTD3DexmgConfig):
         "gamma": cfg.algo.gamma,
         "chunk_len": chunk_len,  ##################
         "gamma_chunk": gamma_chunk,  ##################
-        "storage": "chunk_v2_prev_residual_boundary",
+        "storage": "chunk_v3_discrete_task_id",
+        "task_routing": {
+            "enabled": cfg.agent.task_specific_actor,
+            "task_id_obs_key": cfg.agent.task_id_obs_key,
+            "candidate_tasks": task_names,
+        },
         "temporal_boundary_context": "prev_residual_last_v1",
         "gripper_filter": {
             "close_threshold": base_policy.args.gripper_close_threshold,
@@ -2079,14 +2577,27 @@ def main(cfg: ResidualTD3DexmgConfig):
                 # each observation (and next observation).  Persisting that
                 # buffer makes subsequent runs independent of this full-dataset
                 # encoding pass.
-                offline_rl_tokens = encode_all(rl_token_encoder, embedding_store, device)
+                if embedding_store is not None:
+                    offline_rl_tokens = encode_all(
+                        rl_token_encoder, embedding_store, device
+                    )
+                else:
+                    print(
+                        "Offline replay cache is missing; streaming VLA "
+                        "embeddings through the trained RL-token encoder "
+                        "without writing an embedding cache."
+                    )
             added = _populate_offline_buffer(
                 dataset=dataset,
                 rb=offline_rb,
                 image_keys=image_keys,
                 num_episodes=cfg.offline_data.num_episodes,
                 use_base_policy_for_base_actions=cfg.offline_data.use_base_policy_for_base_actions,
-                base_policy=base_policy if cfg.offline_data.use_base_policy_for_base_actions else None,
+                base_policy=(
+                    base_policy
+                    if cfg.offline_data.use_base_policy_for_base_actions or cfg.rl_token.enabled
+                    else None
+                ),
             )
 
             print(f"Added {added} offline transitions to buffer (size={len(offline_rb)})")
@@ -2111,14 +2622,110 @@ def main(cfg: ResidualTD3DexmgConfig):
             "reward camera for online rollout..."
         )
         base_policy.connect_online_resources(required=True)
+
+    initial_eval_success_rates = None
+    configured_initial_eval_log = getattr(cfg, "initial_task_success_log", None)
+    configured_initial_eval_overrides = getattr(
+        cfg, "initial_task_success_window_overrides", None
+    )
+    has_configured_initial_windows = (
+        configured_initial_eval_log is not None
+        or configured_initial_eval_overrides is not None
+    )
+    if has_configured_initial_windows and not getattr(cfg, "resume", False):
+        if base_policy.task_reward_generator is None:
+            raise RuntimeError(
+                "Initial task success windows were configured before the task "
+                "reward generator was connected"
+            )
+        candidate_tasks = list(
+            base_policy.task_reward_generator.candidate_tasks
+        )
+        log_eval_outcomes = None
+        if configured_initial_eval_log is not None:
+            log_eval_outcomes = load_initial_eval_outcomes_from_log(
+                configured_initial_eval_log,
+                candidate_tasks=candidate_tasks,
+                window_size=cfg.task_success_window_size,
+            )
+        initial_eval_outcomes = apply_initial_eval_outcome_overrides(
+            log_eval_outcomes,
+            configured_initial_eval_overrides,
+            candidate_tasks=candidate_tasks,
+            window_size=cfg.task_success_window_size,
+        )
+        base_policy.task_reward_generator.initialize_task_success_windows(
+            initial_eval_outcomes
+        )
+        initial_eval_success_rates = {
+            task: sum(outcomes) / len(outcomes)
+            for task, outcomes in initial_eval_outcomes.items()
+        }
+        formatted_rates = ", ".join(
+            f"{task}: {rate:.2%}"
+            for task, rate in initial_eval_success_rates.items()
+        )
+        if configured_initial_eval_log is not None:
+            print(
+                f"Loaded per-task {cfg.task_success_window_size}-slot initial "
+                "success windows from "
+                f"{Path(configured_initial_eval_log).expanduser().resolve()}"
+            )
+        if configured_initial_eval_overrides is not None:
+            overridden_tasks = list(configured_initial_eval_overrides)
+            print(
+                "Applied configured initial success-window overrides for: "
+                f"{overridden_tasks}"
+            )
+        print(f"Initial task success rates: {formatted_rates}")
+        if cfg.eval_first:
+            print(
+                "Skipping step-0 robot evaluation because "
+                "initial task success windows are configured."
+            )
+    elif configured_initial_eval_overrides is not None:
+        print(
+            "Ignoring initial_task_success_window_overrides while resuming; "
+            "the checkpoint's newer rolling-window state takes precedence."
+        )
+
+    configured_task_output_root = getattr(cfg, "task_output_root", None)
+    if configured_task_output_root is not None:
+        task_output_root_path = (
+            Path(configured_task_output_root).expanduser().resolve()
+        )
+        if not task_output_root_path.is_dir():
+            raise FileNotFoundError(
+                "Configured task_output_root does not exist or is not a "
+                f"directory: {task_output_root_path}"
+            )
+        if base_policy.task_reward_generator is None:
+            raise RuntimeError(
+                "task_output_root was configured before the task reward "
+                "generator was connected"
+            )
+        base_policy.task_reward_generator.restore_output_root(
+            task_output_root_path
+        )
+        print(f"Appending task artifacts in: {task_output_root_path}")
     
     # ------------------------------------------------------------------
     # Warm-up phase (random policy) --------------------------------------
     # ------------------------------------------------------------------
 
+    # Match the cached-warmup path used by the RL-token entry point: random
+    # warmup transitions belong in replay, but their task outcomes must not
+    # advance the learned-policy success curves or adaptive sampling windows.
+    # Restore this snapshot after an in-process warmup has been collected.
+    pre_warmup_task_success_stats = copy.deepcopy(
+        base_policy.task_reward_generator.task_success_stats
+    )
+    fresh_warmup_collected = False
+
     # if len(online_rb) < cfg.algo.learning_starts and not loaded_online_from_cache and not getattr(cfg, "resume", False):
     #     print(f"Warm-up: filling online buffer with {cfg.algo.learning_starts - len(online_rb)} random steps…")
     if len(online_rb) < learning_starts_chunks and not loaded_online_from_cache and not getattr(cfg, "resume", False):  ##################
+        fresh_warmup_collected = True
         warmup_dir = base_policy.task_reward_generator.set_output_warmup()
         print(f"Warm-up: filling online buffer with {learning_starts_chunks - len(online_rb)} random chunks "  ##################
               f"({(learning_starts_chunks - len(online_rb)) * chunk_len} steps)…")  ##################
@@ -2131,7 +2738,7 @@ def main(cfg: ResidualTD3DexmgConfig):
         # task_emb = lang_embedder(task_prompt)
         obs, task_prompt = base_policy.reset()
         task_emb = lang_embedder(task_prompt) if lang_embedder is not None else None
-        obs = _attach_task_emb(obs= obs,task_emb=task_emb)
+        obs = _attach_task_context(obs, task_prompt, task_emb)
         # --------------------------------------------------------------
         # Logging helper: print progress every 1 000 collected transitions
         # --------------------------------------------------------------
@@ -2190,7 +2797,7 @@ def main(cfg: ResidualTD3DexmgConfig):
             # print(f"[warmup] after step: reward={reward}, done={done}")
             task_prompt = info["task_prompt"]
             task_emb = lang_embedder(task_prompt) if lang_embedder is not None else None
-            next_obs = _attach_task_emb(next_obs, task_emb)
+            next_obs = _attach_task_context(next_obs, task_prompt, task_emb)
             reward_sum += reward.sum().item()
             episode_count += done.float().sum().item()
             # reward_sum += reward
@@ -2245,6 +2852,14 @@ def main(cfg: ResidualTD3DexmgConfig):
             _hf_upload_buffer(ONLINE_HF_REPO, online_cache_dir, online_cache_hash)
         print(f"Warm-up done. Online buffer size = {len(online_rb)} transitions")
 
+        base_policy.task_reward_generator.restore_task_success_stats(
+            pre_warmup_task_success_stats
+        )
+        print(
+            "Restored pre-warmup task success windows; random warmup outcomes "
+            "are excluded from learned-policy episode counts and W&B curves."
+        )
+
         loaded_online_from_cache = True  # treat as cached going forward
     
     global_step = 0
@@ -2256,12 +2871,26 @@ def main(cfg: ResidualTD3DexmgConfig):
 
     if getattr(cfg, "resume", False) and getattr(cfg, "resume_checkpoint", None):
         print(f"Resuming training from checkpoint: {cfg.resume_checkpoint}")
+        load_exact_replay = bool(
+            cfg.save_replay_on_checkpoint
+            and getattr(cfg, "require_exact_replay_on_resume", True)
+        )
+        if not load_exact_replay:
+            if len(online_rb) == 0:
+                raise RuntimeError(
+                    "Exact replay resume was disabled, but no compatible "
+                    "generic online replay cache was loaded."
+                )
+            print(
+                "WARNING: exact checkpoint replay resume is disabled; using "
+                f"the compatible generic online replay cache (size={len(online_rb)})."
+            )
         resume_state = load_training_checkpoint(
             ckpt_path=cfg.resume_checkpoint,
             agent=agent,
             online_rb=online_rb,
             device=device,
-            load_replay_buffer=cfg.save_replay_on_checkpoint,
+            load_replay_buffer=load_exact_replay,
         )
 
         global_step = resume_state["global_step"]
@@ -2270,7 +2899,13 @@ def main(cfg: ResidualTD3DexmgConfig):
         episode_count = resume_state["episode_count"]
         actor_updates = resume_state["actor_updates"]
 
-        if resume_state.get("task_output_root"):
+        if configured_task_output_root is not None:
+            print(
+                "Using explicitly configured task artifact root instead of "
+                "the root stored in the checkpoint: "
+                f"{base_policy.task_reward_generator.output_root}"
+            )
+        elif resume_state.get("task_output_root"):
             base_policy.task_reward_generator.restore_output_root(
                 resume_state["task_output_root"]
             )
@@ -2286,13 +2921,26 @@ def main(cfg: ResidualTD3DexmgConfig):
 
         saved_task_stats = resume_state.get("task_success_stats")
         if cfg.algo.reset_task_success_rates_on_restart:
-            print("Task success rates reset to 0.5 after restart.")
+            print("Task rolling success-rate state reset to baseline 0.5 after restart.")
         elif saved_task_stats is None:
             print(
                 "Checkpoint has no task_success_stats; task success rates "
                 "remain initialized at 0.5."
             )
         else:
+            saved_task_stats, migrated_eval_path = _backfill_initial_eval_outcomes(
+                saved_task_stats,
+                task_output_root=resume_state.get("task_output_root"),
+                candidate_tasks=list(
+                    base_policy.task_reward_generator.candidate_tasks
+                ),
+                window_size=cfg.task_success_window_size,
+            )
+            if migrated_eval_path is not None:
+                print(
+                    "Recovered ordered initial evaluation outcomes for the "
+                    f"rolling windows from {migrated_eval_path}"
+                )
             base_policy.task_reward_generator.restore_task_success_stats(
                 saved_task_stats
             )
@@ -2377,18 +3025,92 @@ def main(cfg: ResidualTD3DexmgConfig):
         group=cfg.wandb.group,
     )
 
+    # Give every per-task success-rate chart its own episode-count x-axis.
+    # Since collector logging omits a task's success_rate when another task is
+    # executed, its curve advances only when that task completes an episode.
+    task_metric_names = (
+        list(base_policy.task_reward_generator.candidate_tasks)
+        if base_policy.task_reward_generator is not None
+        else list(cfg.candidate_tasks or [])
+    )
+    for task_index, _task in enumerate(task_metric_names):
+        count_metric = f"tasks/task_{task_index}_episode_count"
+        wandb.define_metric(count_metric)
+        wandb.define_metric(
+            f"tasks/task_{task_index}_success_rate",
+            step_metric=count_metric,
+        )
+
+    if initial_eval_success_rates is not None:
+        initial_curve_metrics = {}
+        for task_index, task in enumerate(task_metric_names):
+            initial_curve_metrics[f"tasks/task_{task_index}_episode_count"] = 0
+            initial_curve_metrics[f"tasks/task_{task_index}_attempts"] = 0
+            initial_curve_metrics[f"tasks/task_{task_index}_success_rate"] = (
+                initial_eval_success_rates[task]
+            )
+        wandb.log(initial_curve_metrics, step=0)
+        print(
+            "Logged reused initial success-rate means at episode_count=0 "
+            "for the new run."
+        )
+
     # Log horizon to wandb summary
     # wandb.summary["environment/horizon"] = env.vec_env.metadata["horizon"]
 
-    # A fresh run gets one timestamped directory. Exact resume reuses the run
-    # directory containing the selected checkpoint so checkpoints and outputs
-    # remain in one place across process restarts.
+    # A fresh run gets one timestamped directory. Before the first checkpoint,
+    # run_output_dir can reconnect a restarted process to that initial
+    # directory. Exact checkpoint resume infers and reuses the same directory.
+    configured_run_output_dir = getattr(cfg, "run_output_dir", None)
     reuse_run_dir = bool(
         resume_state is not None
         and cfg.reuse_run_dir_on_resume
         and getattr(cfg, "resume_checkpoint", None)
     )
-    if reuse_run_dir:
+
+    def _checkpoint_steps(directory: Path) -> list[int]:
+        steps = []
+        for candidate in directory.glob("checkpoint_*.pt"):
+            try:
+                steps.append(int(candidate.stem.removeprefix("checkpoint_")))
+            except ValueError:
+                continue
+        return steps
+
+    if configured_run_output_dir is not None:
+        run_cache_dir = Path(configured_run_output_dir).expanduser().resolve()
+        if not run_cache_dir.is_dir():
+            raise FileNotFoundError(
+                "Configured run_output_dir does not exist or is not a "
+                f"directory: {run_cache_dir}"
+            )
+        model_save_dir = run_cache_dir / "models"
+        existing_checkpoint_steps = _checkpoint_steps(model_save_dir)
+        if resume_state is None and existing_checkpoint_steps:
+            raise RuntimeError(
+                f"run_output_dir already contains checkpoint step "
+                f"{max(existing_checkpoint_steps)}. Resume from its latest "
+                "checkpoint instead of starting from step 0."
+            )
+        if reuse_run_dir:
+            resume_ckpt_path = Path(cfg.resume_checkpoint).expanduser().resolve()
+            if resume_ckpt_path.parent != model_save_dir:
+                raise ValueError(
+                    "run_output_dir must contain resume_checkpoint; got "
+                    f"run_output_dir={run_cache_dir}, "
+                    f"resume_checkpoint={resume_ckpt_path}"
+                )
+            newer_steps = [
+                step for step in existing_checkpoint_steps if step > global_step
+            ]
+            if newer_steps:
+                raise RuntimeError(
+                    f"Refusing in-place resume from step {global_step}: run "
+                    f"directory already contains newer checkpoint step "
+                    f"{max(newer_steps)}. Resume the latest checkpoint."
+                )
+        print(f"Reusing configured run directory: {run_cache_dir}")
+    elif reuse_run_dir:
         resume_ckpt_path = Path(cfg.resume_checkpoint).expanduser().resolve()
         model_save_dir = resume_ckpt_path.parent
         if model_save_dir.name != "models":
@@ -2399,12 +3121,7 @@ def main(cfg: ResidualTD3DexmgConfig):
             )
         run_cache_dir = model_save_dir.parent
 
-        checkpoint_steps = []
-        for candidate in model_save_dir.glob("checkpoint_*.pt"):
-            try:
-                checkpoint_steps.append(int(candidate.stem.removeprefix("checkpoint_")))
-            except ValueError:
-                continue
+        checkpoint_steps = _checkpoint_steps(model_save_dir)
         newer_steps = [step for step in checkpoint_steps if step > global_step]
         if newer_steps:
             raise RuntimeError(
@@ -2515,11 +3232,13 @@ def main(cfg: ResidualTD3DexmgConfig):
         episode_queue = queue.Queue()
         weights_queue = queue.Queue(maxsize=1)
         stop_event = threading.Event()
-        
-        
-        collector_thread = threading.Thread(
-            target=collector_loop,
-            args=( cfg,
+        checkpoint_sync = EpisodeCheckpointCoordinator()
+        collector_errors = []
+
+        def _run_collector():
+            try:
+                collector_loop(
+                    cfg,
                     lang_cfg,
                     lang_embedder,
                     device,
@@ -2529,6 +3248,7 @@ def main(cfg: ResidualTD3DexmgConfig):
                     episode_queue,
                     weights_queue,
                     stop_event,
+                    checkpoint_sync,
                     training_timer,
                     run_name,
                     outputs_dir,
@@ -2540,13 +3260,22 @@ def main(cfg: ResidualTD3DexmgConfig):
                     global_step,
                     episode_count,
                     best_eval_success_rate,
-                    ),
+                    fresh_warmup_collected,
+                )
+            except BaseException as exc:
+                collector_errors.append(exc)
+                checkpoint_sync.mark_failed(exc)
+                stop_event.set()
+
+        collector_thread = threading.Thread(
+            target=_run_collector,
             daemon=True,
         )
 
         collector_thread.start()
 
-        learner_loop( cfg,
+        try:
+            learner_loop( cfg,
                     device,
                     agent,
                     online_rb,
@@ -2557,6 +3286,7 @@ def main(cfg: ResidualTD3DexmgConfig):
                     episode_queue,
                     weights_queue,
                     stop_event,
+                    checkpoint_sync,
                     model_save_dir,
                     run_name,
                     str(base_policy.task_reward_generator.output_root),
@@ -2569,8 +3299,13 @@ def main(cfg: ResidualTD3DexmgConfig):
                     episode_count,
                     best_eval_success_rate,
                     training_cum_time,)
+        finally:
+            stop_event.set()
+            checkpoint_sync.wake_waiters()
+            collector_thread.join()
 
-        collector_thread.join()
+        if collector_errors:
+            raise RuntimeError("Collector thread failed") from collector_errors[0]
 
     launch_async_training()
     

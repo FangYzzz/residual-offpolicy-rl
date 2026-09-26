@@ -19,7 +19,95 @@ from resfit.rl_finetuning.off_policy.rl.critic import Critic
 from resfit.rl_finetuning.off_policy.rl.lang_encoder import LanguageEncoder
 
 
+def _validated_task_ids(
+    task_ids: torch.Tensor,
+    *,
+    batch_size: int,
+    num_tasks: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Normalize a scalar/[B]/[B,1] task id tensor and validate its range."""
+    ids = torch.as_tensor(task_ids, device=device)
+    if ids.is_floating_point():
+        rounded = ids.round()
+        if not torch.equal(ids, rounded):
+            raise ValueError(f"task ids must be integers, got {ids.detach().cpu().tolist()}")
+        ids = rounded
+    ids = ids.to(dtype=torch.long).reshape(-1)
+    if ids.numel() == 1 and batch_size > 1:
+        ids = ids.expand(batch_size)
+    if ids.numel() != batch_size:
+        raise ValueError(
+            f"Expected {batch_size} task ids, got shape {tuple(task_ids.shape)}"
+        )
+    if ids.numel() and (ids.min().item() < 0 or ids.max().item() >= num_tasks):
+        raise ValueError(
+            f"task ids must be in [0, {num_tasks - 1}], got "
+            f"{sorted(ids.unique().detach().cpu().tolist())}"
+        )
+    return ids
 
+
+def _select_obs_rows(
+    obs: dict[str, torch.Tensor], indices: torch.Tensor, batch_size: int
+) -> dict[str, torch.Tensor]:
+    selected = {}
+    for key, value in obs.items():
+        if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == batch_size:
+            selected[key] = value.index_select(0, indices)
+        else:
+            selected[key] = value
+    return selected
+
+
+class TaskSpecificActor(nn.Module):
+    """Batch router over fully independent residual actors."""
+
+    def __init__(self, actors: list[Actor], task_id_obs_key: str):
+        super().__init__()
+        if not actors:
+            raise ValueError("TaskSpecificActor requires at least one actor")
+        self.actors = nn.ModuleList(actors)
+        self.task_id_obs_key = task_id_obs_key
+        self.last_sigma: torch.Tensor | None = None
+
+    def forward(self, obs: dict[str, torch.Tensor], std: float):
+        feat = obs["feat"]
+        batch_size = feat.shape[0]
+        if self.task_id_obs_key not in obs:
+            raise KeyError(
+                f"Task-specific actor requires '{self.task_id_obs_key}' in every observation"
+            )
+        task_ids = _validated_task_ids(
+            obs[self.task_id_obs_key],
+            batch_size=batch_size,
+            num_tasks=len(self.actors),
+            device=feat.device,
+        )
+
+        loc = None
+        scale = None
+        routed_sigma = None
+        for task_id in task_ids.unique(sorted=True).tolist():
+            indices = (task_ids == task_id).nonzero(as_tuple=False).flatten()
+            task_obs = _select_obs_rows(obs, indices, batch_size)
+            task_dist = self.actors[task_id](task_obs, std)
+            if loc is None:
+                loc = task_dist.loc.new_zeros((batch_size, task_dist.loc.shape[-1]))
+                scale = task_dist.scale.new_zeros((batch_size, task_dist.scale.shape[-1]))
+            loc = loc.index_copy(0, indices, task_dist.loc)
+            scale = scale.index_copy(0, indices, task_dist.scale)
+
+            sigma = self.actors[task_id].last_sigma
+            if sigma is not None:
+                if routed_sigma is None:
+                    routed_sigma = sigma.new_zeros((batch_size, sigma.shape[-1]))
+                routed_sigma = routed_sigma.index_copy(0, indices, sigma)
+
+        if loc is None or scale is None:
+            raise RuntimeError("Cannot route an empty actor batch")
+        self.last_sigma = routed_sigma
+        return utils.TruncatedNormal(loc, scale)
 
 
 class QAgentLang(nn.Module):
@@ -64,6 +152,16 @@ class QAgentLang(nn.Module):
         self.rl_cameras = rl_cameras
         self.cfg = cfg
         self.residual_actor = residual_actor
+        self.task_specific_actor = bool(getattr(cfg, "task_specific_actor", False))
+        self.num_tasks = int(getattr(cfg, "num_tasks", 1))
+        self.task_id_obs_key = str(
+            getattr(cfg, "task_id_obs_key", "observation.task_id")
+        )
+        if self.task_specific_actor and self.num_tasks < 2:
+            raise ValueError(
+                "task_specific_actor requires num_tasks >= 2, "
+                f"got {self.num_tasks}"
+            )
         self.action_chunk_len = int(getattr(cfg, "action_chunk_len", 1))
         if self.action_chunk_len < 1 or action_dim % self.action_chunk_len != 0:
             raise ValueError(
@@ -130,14 +228,33 @@ class QAgentLang(nn.Module):
             prop_dim = raw_prop_dim
         self._effective_prop_dim: int = int(prop_dim)
 
-        self.critic = Critic(
-            repr_dim=repr_dim,
-            patch_repr_dim=patch_repr_dim,
-            prop_dim=prop_dim,
-            action_dim=action_dim,
-            cfg=self.cfg.critic,
-        )
-        self.actor = Actor(repr_dim, patch_repr_dim, prop_dim, action_dim, cfg.actor, residual_actor=residual_actor)
+        def make_critic():
+            return Critic(
+                repr_dim=repr_dim,
+                patch_repr_dim=patch_repr_dim,
+                prop_dim=prop_dim,
+                action_dim=action_dim,
+                cfg=self.cfg.critic,
+            )
+
+        def make_actor():
+            return Actor(
+                repr_dim,
+                patch_repr_dim,
+                prop_dim,
+                action_dim,
+                cfg.actor,
+                residual_actor=residual_actor,
+            )
+
+        self.critic = make_critic()
+        if self.task_specific_actor:
+            self.actor = TaskSpecificActor(
+                [make_actor() for _ in range(self.num_tasks)],
+                self.task_id_obs_key,
+            )
+        else:
+            self.actor = make_actor()
 
         self.critic_target = copy.deepcopy(self.critic)
         self.actor_target = copy.deepcopy(self.actor)
@@ -262,6 +379,45 @@ class QAgentLang(nn.Module):
         new_obs["observation.state"] = new_state
         return new_obs
 
+    def _critic_forward(self, critic, obs, action, *, return_logits=False):
+        return critic(
+            obs["feat"],
+            obs["observation.state"],
+            action,
+            return_logits=return_logits,
+        )
+
+    def _critic_q_value(self, critic, obs, action):
+        return critic.q_value(obs["feat"], obs["observation.state"], action)
+
+    def _critic_q_value_for_policy(self, obs, action):
+        return self.critic.q_value_for_policy(
+            obs["feat"], obs["observation.state"], action
+        )
+
+    @torch.no_grad()
+    def predict_q(self, obs: dict[str, torch.Tensor], action: torch.Tensor):
+        """Public shared-critic Q query used by evaluation/diagnostics."""
+        return self._critic_q_value(self.critic, obs, action)
+
+    def _soft_update_task_networks(self, source, target, obs):
+        """Update the shared critic or only the actor heads in this batch."""
+        if not isinstance(source, TaskSpecificActor):
+            utils.soft_update_params(source, target, self.cfg.critic_target_tau)
+            return
+        task_ids = _validated_task_ids(
+            obs[self.task_id_obs_key],
+            batch_size=obs["feat"].shape[0],
+            num_tasks=self.num_tasks,
+            device=obs["feat"].device,
+        )
+        for task_id in task_ids.unique().tolist():
+            utils.soft_update_params(
+                source.actors[task_id],
+                target.actors[task_id],
+                self.cfg.critic_target_tau,
+            )
+
     # ------------------------------------------------------------------ #
     def _build_encoders(self, obs_shape):
         """Constructs and returns an ``nn.ModuleList`` with one encoder per
@@ -363,7 +519,7 @@ class QAgentLang(nn.Module):
         return should_unsqueeze
 
     @torch.no_grad()
-    def _gate_adopt_mask(self, feat, prop, base_action, combined, *, use_target: bool = False):
+    def _gate_adopt_mask(self, obs, base_action, combined, *, use_target: bool = False):
         """Return ``(adopt, adv)`` where ``adopt`` is a (B, 1) bool mask that is True
         where the combined action is adopted, i.e. the critic's advantage
         ``Q(comb) - Q(base) > residual_gate_threshold``.
@@ -372,8 +528,8 @@ class QAgentLang(nn.Module):
         the comparison is consistent.
         """
         critic = self.critic_target if use_target else self.critic
-        q_base = critic(feat, prop, base_action).mean(dim=0).reshape(-1)  # (B,)
-        q_comb = critic(feat, prop, combined).mean(dim=0).reshape(-1)     # (B,)
+        q_base = self._critic_forward(critic, obs, base_action).mean(dim=0).reshape(-1)
+        q_comb = self._critic_forward(critic, obs, combined).mean(dim=0).reshape(-1)
         adv = q_comb - q_base                                            # (B,)
         adopt = adv > self.residual_gate_threshold                       # (B,)
         if not use_target:  # acting path -> stash for eval logging
@@ -411,7 +567,7 @@ class QAgentLang(nn.Module):
             base_action = obs["observation.base_action"]
             combined = torch.clamp(base_action + action, -1.0, 1.0)
             adopt, _adv = self._gate_adopt_mask(
-                obs["feat"], obs["observation.state"], base_action, combined, use_target=False
+                obs, base_action, combined, use_target=False
             )
             adopt_rate = adopt.float().mean().item()
             if eval_mode:
@@ -512,8 +668,7 @@ class QAgentLang(nn.Module):
                 # base action where the combined one is not a clear improvement.
                 if self.use_residual_gate:
                     adopt, _adv = self._gate_adopt_mask(
-                        next_obs["feat"], next_obs["observation.state"],
-                        next_base_action, next_action, use_target=True,
+                        next_obs, next_base_action, next_action, use_target=True,
                     )
                     next_action = torch.where(adopt, next_action, next_base_action)
                     self._gate_adopt_rate = adopt.float().mean().item()
@@ -521,7 +676,9 @@ class QAgentLang(nn.Module):
                 next_action = next_residual_action
 
             # Compute target Q using min over a random subset of 2 heads
-            target_all = self.critic_target.q_value(next_obs["feat"], next_obs["observation.state"], next_action)
+            target_all = self._critic_q_value(
+                self.critic_target, next_obs, next_action
+            )
             # print(f"target_all shape: ", target_all.shape)
             target_q_min = target_all.squeeze(-1)  # [B]
             # print(target_q_min.mean())
@@ -534,18 +691,22 @@ class QAgentLang(nn.Module):
 
         if self.critic.loss_cfg.type == "hl_gauss":
             # Compute logits for current Q heads and average HL-Gauss loss across heads
-            q_per_head, logits_per_head = self.critic(obs["feat"], obs["observation.state"], action, return_logits=True)
+            q_per_head, logits_per_head = self._critic_forward(
+                self.critic, obs, action, return_logits=True
+            )
             K = logits_per_head.shape[0]
             losses = [self.critic.hl_loss(logits_per_head[i], target_q) for i in range(K)]
             critic_loss = torch.stack(losses).mean()
         elif self.critic.loss_cfg.type == "c51":
             # Compute logits for current Q heads and C51 distributional loss
-            q_per_head, logits_per_head = self.critic(obs["feat"], obs["observation.state"], action, return_logits=True)
+            q_per_head, logits_per_head = self._critic_forward(
+                self.critic, obs, action, return_logits=True
+            )
 
             # Get next state distribution for C51 target computation
             with torch.no_grad():
-                _, next_logits = self.critic_target(
-                    next_obs["feat"], next_obs["observation.state"], next_action, return_logits=True
+                _, next_logits = self._critic_forward(
+                    self.critic_target, next_obs, next_action, return_logits=True
                 )
                 # Take min over random subset of heads for next distribution (configurable via min_q_heads)
                 num_heads = min(self.critic.cfg.min_q_heads, next_logits.shape[0])
@@ -566,7 +727,7 @@ class QAgentLang(nn.Module):
             losses = [self.critic.c51_loss(logits_per_head[i], target_distribution) for i in range(K)]
             critic_loss = torch.stack(losses).mean()
         else:
-            q_all = self.critic(obs["feat"], obs["observation.state"], action).squeeze(-1)  # [K,B]
+            q_all = self._critic_forward(self.critic, obs, action).squeeze(-1)  # [K,B]
             # Compute TD errors for prioritized experience replay (before taking mean)
             td_errors = torch.abs(q_all - target_q.unsqueeze(0)).mean(dim=0)  # [B] - mean across heads
 
@@ -678,7 +839,7 @@ class QAgentLang(nn.Module):
         else:
             combined_action = action_pred
 
-        q = self.critic.q_value_for_policy(obs["feat"], obs["observation.state"], combined_action)
+        q = self._critic_q_value_for_policy(obs, combined_action)
         actor_loss_base = -q.mean()
 
         intra_smoothness_loss, boundary_smoothness_loss = (
@@ -882,8 +1043,8 @@ class QAgentLang(nn.Module):
                 bc_obs = bc_batch.obs
                 curr_action = self.act(bc_obs, eval_mode=True, cpu=False)
 
-                curr_q = self.critic.q_value_for_policy(bc_obs["feat"], bc_obs["observation.state"], curr_action)
-                ref_q = self.critic.q_value_for_policy(bc_obs["feat"], bc_obs["observation.state"], ref_action)
+                curr_q = self._critic_q_value_for_policy(bc_obs, curr_action)
+                ref_q = self._critic_q_value_for_policy(bc_obs, ref_action)
 
                 ratio = (ref_q > curr_q).float().mean().item()
 
@@ -963,7 +1124,7 @@ class QAgentLang(nn.Module):
             stddev=stddev,
             importance_weights=importance_weights,
         )
-        utils.soft_update_params(self.critic, self.critic_target, self.cfg.critic_target_tau)
+        self._soft_update_task_networks(self.critic, self.critic_target, obs)
         metrics.update(critic_metric)
 
         if not update_actor:
@@ -1003,7 +1164,7 @@ class QAgentLang(nn.Module):
                 has_prev_residual=has_prev_residual,
             )
 
-        utils.soft_update_params(self.actor, self.actor_target, self.cfg.critic_target_tau)
+        self._soft_update_task_networks(self.actor, self.actor_target, actor_obs)
         metrics.update(actor_metric)
 
         return metrics

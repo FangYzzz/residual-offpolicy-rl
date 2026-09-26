@@ -50,11 +50,11 @@ class RLTokenConfig:
     # Optional smoke-test limit. When set, this overrides
     # offline_data.num_episodes for embedding collection, VAE training, and
     # offline replay construction so every stage uses the same subset.
-    offline_num_episodes: int | None = 460
+    offline_num_episodes: int | None = 590  # 460
     obs_key: str = "observation.rl_token"
     vla_embedding_key: str = "vla_embedding"
     embedding_cache_dir: str = "vla_embedding_cache"
-    checkpoint_dir: str = "rl_token_checkpoints"
+    checkpoint_dir: str = "rl_token_checkpoints_10070_step65000"
     force_recollect_embeddings: bool = False
     # Number of embeddings buffered in RAM before an atomic disk shard is
     # written. Raw VLA sequences are never accumulated for the full dataset.
@@ -108,16 +108,16 @@ class ResidualTD3AlgoConfig(RLPDAlgoConfig):
     # False: residual_action = pure_random - base_action (resulting in pure_random)
     use_base_policy_for_warmup: bool = True
 
-    # Whether a resumed training process should discard the per-task Beta
-    # success-rate statistics and restart every task from 0.5. Set to False
-    # to restore those statistics from the training checkpoint.
+    # Whether a resumed training process should discard the per-task rolling
+    # success-rate state and restart every task from the default 0.5 baseline.
+    # Set to False to restore that state from the training checkpoint.
     reset_task_success_rates_on_restart: bool = False  # Restore per-task success rates from the checkpoint on resume.
 
     # ------------------------------------------------------------------
     # Standard deviation schedule -------------------------------------------
     # ------------------------------------------------------------------
-    stddev_max: float = 0.006 # 0.05
-    stddev_min: float = 0.001 # 0.05
+    stddev_max: float = 0.003 # 0.006 # 0.05
+    stddev_min: float = 0.003 # 0.001 # 0.05
     stddev_step: int = 100_000 # 300_000
 
     # Progressive clipping schedule for the residual actions
@@ -131,6 +131,59 @@ class ResidualTD3AlgoConfig(RLPDAlgoConfig):
 @dataclass
 class ResidualTD3DexmgConfig(RLPDDexmgConfig):
     actor_name: str | None = None  # Inferred from base policy config
+
+    # The chunked multi-task trainer maps candidate_tasks[i] to actor_i. The
+    # visual/RL-token encoder and task-conditioned critic remain shared.
+    task_specific_actor: bool = True
+
+    # Optionally append task/reward logs and artifacts to an existing run.
+    # Training stays in the current step_<N>/log.txt; each evaluation switches
+    # the logger to the directory for its own global step.
+    task_output_root: str | None = None
+
+    # Restrict online task sampling/evaluation to these exact task prompts.
+    # None preserves the TaskRewardGenerator's current default task set.
+    candidate_tasks: list[str] | None = None
+    # candidate_tasks: list[str] | None = field(
+    #     default_factory=lambda: [
+    #         "Put a cube into the bowl",
+    #         "Take the cube out of the bowl",
+    #         "Stack one cube on the other cube",
+    #         "Take the top cube off the other cube",
+    #         "Open the drawer",
+    #         "Close the drawer",
+    #         "Hang the mug on the mug tree",
+    #         "Take the mug off the mug tree",
+    #     ]
+    # )
+
+    # Per-task success is a rolling mean over N binary outcomes. The initial
+    # evaluation's ordered N outcomes seed the window; training episodes then
+    # replace those evaluation outcomes one by one.
+    task_success_window_size: int = 20
+
+    # A task whose rolling success rate reaches 1.0 keeps this exact sampling
+    # probability whenever at least one other feasible task is not mastered.
+    # The remaining probability mass is distributed among the other feasible
+    # tasks in proportion to 1 - success_rate.
+    min_task_sample_probability: float = 0.05
+
+    # Curriculum switch. True prioritizes feasible tasks with lower rolling
+    # success rates; False samples uniformly from the feasible task set.
+    prioritize_low_success_tasks: bool = True
+
+    # A fresh run can reuse the ordered step-0 evaluation outcomes in this log
+    # instead of evaluating the robot again. Set this and the overrides below
+    # to None to run eval_first.
+    # Checkpoint resume always restores the checkpoint's newer window state.
+    initial_task_success_log: str | None = None
+
+    # Optional per-task overrides applied on top of initial_task_success_log.
+    # Each value must contain exactly task_success_window_size ordered 0/1
+    # outcomes. Keys may be a subset of candidate_tasks when a log supplies the
+    # other tasks; without a log, every candidate task must be provided.
+    # These overrides apply only to fresh runs, never checkpoint resumes.
+    initial_task_success_window_overrides: dict[str, list[int]] | None = None
 
     # ------------------------------------------------------------------
     # Algorithm & optimisation
@@ -175,10 +228,17 @@ class ResidualTD3DexmgConfig(RLPDDexmgConfig):
     # Save robot debug-camera frames and GPT before/after scene images for
     # evaluation, online training, and online replay-buffer warmup.
     save_images: bool = True
+    # Save one complete XYZ base/residual/combined action plot and its raw CSV
+    # after every online training episode. This is independent of save_images.
+    save_episode_action_plots: bool = False
 
-    eval_interval_every_steps: int = 40_000  ### 10_000
+    # Master switch for both the step-0 and periodic robot evaluations.
+    eval_enabled: bool = True
 
-    # Whether to run an evaluation pass before training begins (at step 0)
+    eval_interval_every_steps: int = 100_000  ### 10_000
+
+    # Whether to run an evaluation pass before training begins (at step 0).
+    # This is bypassed when an initial log or window overrides are configured.
     eval_first: bool = True  ### True
 
     resume: bool = False
@@ -188,10 +248,21 @@ class ResidualTD3DexmgConfig(RLPDDexmgConfig):
     # continues at the next chunk instead of repeating that step/evaluation;
     # later evaluation intervals are unchanged.
     skip_completed_eval_on_resume: bool = False
+    # Collector checkpoint threshold. When it is crossed in the middle of an
+    # episode, collection finishes that episode, pauses, and waits for the
+    # learner to process the same step before saving and continuing.
     checkpoint_interval: int = 1000  ### 5000
     # Replay buffers must be checkpointed together with the model so that
     # global_step and buffer/online_size stay consistent after resuming.
     save_replay_on_checkpoint: bool = True
+    # Normally require the replay sidecar paired with resume_checkpoint.
+    # Set False only for recovery when that sidecar was lost; the most recent
+    # compatible generic online cache will be used instead, while future
+    # checkpoints can still save exact replay sidecars.
+    require_exact_replay_on_resume: bool = True
+    # Explicitly reuse an existing run_<timestamp>_<name> directory even when
+    # restarting before the first checkpoint has been created.
+    run_output_dir: str | None = None
     # Keep checkpoints and artifacts in the original run directory when
     # resuming, instead of creating run_<new timestamp>_<name> each time.
     reuse_run_dir_on_resume: bool = True
@@ -295,12 +366,137 @@ class ResidualTD3FrankaComplexConfig(ResidualTD3DexmgConfig):
         )
     )
 
+    # Ablation: remove only low-success task prioritization. The residual gate
+    # remains controlled independently by agent.gate_mode/use_residual_gate.
+    prioritize_low_success_tasks: bool = False
+
+    # Reuse this completed 8-task evaluation for every fresh complex-task run.
+    initial_task_success_log: str | None = (
+        "/home/yuan/self_vla/residual-offpolicy-rl/outputs/"
+        "task_reward_generation/20260901_185152/step_0/log.txt"
+    )
+    initial_task_success_window_overrides: dict[str, list[int]] | None = field(
+        # default_factory=lambda: {
+        #     # 8 / 20 = 0.4
+        #     "Put a cube into the bowl": [
+        #         1, 0, 1, 0, 0,
+        #         1, 0, 1, 0, 0,
+        #         1, 0, 1, 0, 0,
+        #         1, 0, 1, 0, 0,
+        #     ],
+        #     # 10 / 20 = 0.5
+        #     "Open the drawer": [
+        #         1, 1, 0, 0, 1,
+        #         0, 1, 0, 1, 0,
+        #         1, 0, 1, 1, 0,
+        #         0, 0, 1, 1, 0,
+        #     ],
+        #     # 12 / 20 = 0.6
+        #     "Hang the mug on the mug tree": [
+        #         1, 0, 1, 1, 0,
+        #         1, 0, 1, 1, 0,
+        #         1, 0, 1, 1, 0,
+        #         1, 0, 1, 1, 0,
+        #     ],
+        # }
+
+        ### for video recording
+        # default_factory=lambda: {
+        #     # 8 / 20 = 0.4
+        #     "Put a cube into the bowl": [
+        #         0, 1, 1, 1, 1,
+        #         0, 0, 0, 1, 0,
+        #         0, 0, 1, 0, 0,
+        #         0, 0, 1, 0, 1,
+        #     ],
+        #     # 19 / 20 = 0.95
+        #     "Take the cube out of the bowl": [
+        #         1, 1, 1, 1, 1,
+        #         1, 1, 0, 1, 1,
+        #         1, 1, 1, 1, 1,
+        #         1, 1, 1, 1, 1,
+        #     ],
+        #     # 10 / 20 = 0.5
+        #     "Stack one cube on the other cube": [
+        #         0, 1, 0, 0, 1,
+        #         0, 1, 1, 0, 1,
+        #         1, 0, 0, 0, 1,
+        #         1, 0, 1, 1, 0,
+        #     ],
+        #     # 10 / 20 = 0.5
+        #     "Take the top cube off the other cube": [
+        #         1, 1, 1, 1, 1,
+        #         0, 0, 0, 0, 0,
+        #         0, 0, 0, 1, 0,
+        #         1, 1, 1, 1, 0,
+        #     ],
+        #     # 19 / 20 = 0.95
+        #     "Open the drawer": [
+        #         1, 1, 1, 1, 1,
+        #         1, 1, 1, 1, 1,
+        #         0, 1, 1, 1, 1,
+        #         1, 1, 1, 1, 1,
+        #     ],
+        #     # 18 / 20 = 0.9
+        #     "Close the drawer": [
+        #         0, 1, 1, 1, 1,
+        #         1, 1, 1, 1, 1,
+        #         1, 1, 1, 1, 1,
+        #         1, 1, 1, 0, 1,
+        #     ],
+        #     # 15 / 20 = 0.75
+        #     "Hang the mug on the mug tree": [
+        #         1, 1, 0, 1, 1,
+        #         1, 0, 0, 0, 0,
+        #         1, 1, 1, 1, 1,
+        #         1, 1, 1, 1, 1,
+        #     ],
+        #     # 19 / 20 = 0.95
+        #     "Take the mug off the mug tree": [
+        #         1, 1, 0, 1, 1,
+        #         1, 1, 1, 1, 1,
+        #         1, 1, 1, 1, 1,
+        #         1, 1, 1, 1, 1,
+        #     ],
+        # }
+
+        ### for simple task
+        default_factory=lambda: {
+            "Open the drawer": [
+                0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0,
+                0, 0, 0, 0, 1,
+            ],
+            "Put a cube into the bowl": [
+                1, 1, 0, 1, 1,
+                1, 1, 1, 1, 1,
+                1, 1, 1, 1, 1,
+                1, 1, 1, 1, 1,
+            ],
+            "Stack one cube on the other cube": [
+                1, 1, 0, 1, 1,
+                1, 1, 1, 1, 1,
+                1, 1, 1, 1, 1,
+                1, 1, 1, 1, 1,
+            ],
+            "Take the mug off the mug tree": [
+                1, 1, 0, 1, 1,
+                1, 1, 1, 1, 1,
+                1, 1, 1, 1, 1,
+                1, 1, 1, 1, 1,
+            ],
+        }
+    )
+
     wandb: WandBConfig = field(default_factory=lambda: WandBConfig(project="franka-complex-residual-td3"))
 
     offline_data: OfflineDataConfig = field(
         default_factory=lambda: OfflineDataConfig(
-            name="/home/yuan/self_vla/tele_op/lerobot/dataset_7050_7050_5050_7050",
-            num_episodes=460,
+            # name="/home/yuan/self_vla/tele_op/lerobot/dataset_10070_10070_5050_10050",
+            name="/home/yuan/self_vla/tele_op/lerobot/dataset_10070_10070_5050_6050",
+            # num_episodes=590,
+            num_episodes=550,
             horizon=400,   # 这里改成真实 episode 长度
         )
     )

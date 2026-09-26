@@ -6,7 +6,10 @@ import hashlib
 import json
 import dataclasses
 import bisect
+import fcntl
 import os
+import socket
+from contextlib import contextmanager
 from pathlib import Path
 
 import torch
@@ -15,6 +18,36 @@ from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm import tqdm
 
 from resfit.rl_finetuning.off_policy.rl.rl_token import RLTokenVAE
+
+
+@contextmanager
+def embedding_store_lock(root: Path):
+    """Fail fast when another process is using the same embedding store."""
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    lock_path = root / ".collection.lock"
+    lock_file = lock_path.open("a+", encoding="utf-8")
+    try:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            lock_file.seek(0)
+            owner = lock_file.read().strip() or "unknown process"
+            raise RuntimeError(
+                f"Embedding store is already in use: {root} (lock owner: {owner})"
+            ) from exc
+
+        lock_file.seek(0)
+        lock_file.truncate()
+        lock_file.write(f"pid={os.getpid()} host={socket.gethostname()}\n")
+        lock_file.flush()
+        os.fsync(lock_file.fileno())
+        yield
+    finally:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock_file.close()
 
 
 class ShardedEmbeddingDataset(Dataset):
@@ -198,19 +231,37 @@ def _evenly_limit_indices(indices, limit):
 
 def train_or_load_rl_token(embedding_dataset, cfg, root: Path, device):
     """Train once, save a portable checkpoint, then return a frozen module."""
-    if len(embedding_dataset) == 0:
-        raise ValueError("No VLA embeddings were collected")
-    first_embedding, _ = embedding_dataset[0]
-    input_dim = first_embedding.shape[-1]
-    model = RLTokenVAE(
-        input_dim, cfg.token_dim, cfg.model_dim, cfg.num_heads,
-        cfg.encoder_layers, cfg.decoder_layers, cfg.dropout,
-    ).to(device)
     ckpt = root / "rl_token.pt"
     if ckpt.exists() and not cfg.force_retrain:
         state = torch.load(ckpt, map_location=device, weights_only=True)
+        input_dim = state.get("input_dim")
+        if input_dim is None:
+            # Backward compatibility for checkpoints created before input_dim
+            # was saved explicitly.
+            input_proj_weight = state.get("model", {}).get("input_proj.weight")
+            if input_proj_weight is None:
+                raise KeyError(
+                    f"RL-token checkpoint {ckpt} has neither 'input_dim' nor "
+                    "'model.input_proj.weight'"
+                )
+            input_dim = input_proj_weight.shape[1]
+        model = RLTokenVAE(
+            int(input_dim), cfg.token_dim, cfg.model_dim, cfg.num_heads,
+            cfg.encoder_layers, cfg.decoder_layers, cfg.dropout,
+        ).to(device)
         model.load_state_dict(state["model"])
     else:
+        if embedding_dataset is None or len(embedding_dataset) == 0:
+            raise ValueError(
+                "VLA embeddings are required to train the RL-token model, but "
+                "no embedding dataset was provided"
+            )
+        first_embedding, _ = embedding_dataset[0]
+        input_dim = first_embedding.shape[-1]
+        model = RLTokenVAE(
+            input_dim, cfg.token_dim, cfg.model_dim, cfg.num_heads,
+            cfg.encoder_layers, cfg.decoder_layers, cfg.dropout,
+        ).to(device)
         root.mkdir(parents=True, exist_ok=True)
         sequence_length = int(first_embedding.shape[0])
         token_limited_batch_size = max(1, int(cfg.max_tokens_per_batch) // sequence_length)
